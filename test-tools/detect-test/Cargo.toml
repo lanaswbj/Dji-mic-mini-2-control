@@ -1,0 +1,33 @@
+[package]
+name = "detect-test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+# Standalone crate, deliberately outside the workspace in ../../Cargo.toml —
+# this exists only to test pairing-button and mic-tap detection in isolation,
+# without going through the full Tauri app rebuild/relaunch cycle.
+
+[dependencies]
+cpal = "0.15"
+hound = "3.5.1"
+microdsp = "0.1.3"
+# Silero VAD (neural-net voice activity detector, trained on large amounts
+# of real speech) — gates tap classification off while speech is active, so
+# loud/sharp speech can't be misread as a tap no matter how the tap
+# classifier's own features respond to it. Replaced the pure-Rust `earshot`
+# (WebRTC-style, no external files) after it still let too much speech
+# through. This crate's `ort` backend downloads its own ONNX Runtime binary
+# as part of `cargo build` — first build needs network access.
+voice_activity_detector = "0.2.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
+    "Win32_Graphics_Gdi",
+] }

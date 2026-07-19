@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>NSMicrophoneUsageDescription</key>
-  <string>用于读取 BlackHole 虚拟音频并进行 Voice Comfort 实时人声处理。</string>
-</dict>
-</plist>

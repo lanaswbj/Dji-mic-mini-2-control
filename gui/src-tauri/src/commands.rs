@@ -90,14 +90,3 @@ pub fn udev_help() -> UdevHelp {
     }
 }
 
-/// Enumerate macOS audio input/output devices and mark the current defaults.
-#[tauri::command]
-pub fn audio_devices() -> Result<crate::audio::AudioDevices, String> {
-    crate::audio::list()
-}
-
-/// Change the macOS system-wide default input or output device.
-#[tauri::command]
-pub fn set_audio_device(kind: String, device: u32) -> Result<(), String> {
-    crate::audio::set(&kind, device)
-}

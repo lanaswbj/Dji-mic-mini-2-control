@@ -24,30 +24,13 @@ export function udevHelp() {
   return invoke("udev_help");
 }
 
-/** List macOS audio devices and the current system defaults. */
-export function audioDevices() {
-  return invoke("audio_devices");
+/** Install the WinUSB driver for the receiver's control interface (Windows only). */
+export function installUsbDriver() {
+  return invoke("install_usb_driver");
 }
 
-/** Set the system default audio input or output device. */
-export function setAudioDevice(kind, device) {
-  return invoke("set_audio_device", { kind, device });
-}
-
-export function comfortStatus() {
-  return invoke("comfort_status");
-}
-
-export function comfortStart() {
-  return invoke("comfort_start");
-}
-
-export function comfortStop() {
-  return invoke("comfort_stop");
-}
-
-export function comfortSet(parameters) {
-  return invoke("comfort_set", { parameters });
+export function receiverShortcutStatus() {
+  return invoke("receiver_shortcut_status");
 }
 
 export function receiverShortcutStart() {
@@ -56,4 +39,14 @@ export function receiverShortcutStart() {
 
 export function receiverShortcutStop() {
   return invoke("receiver_shortcut_stop");
+}
+
+/** Test-only: whether the pairing button was pressed in the last ~700ms. */
+export function pairingButtonTestActive() {
+  return invoke("pairing_button_test_active");
+}
+
+/** Test-only: the most recently detected mic-tap group (1/2/3 taps). */
+export function micTapTestStatus() {
+  return invoke("mic_tap_test_status");
 }

@@ -2,8 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
-mod audio;
-mod comfort;
+mod driver;
+mod mic_tap;
+mod pairing_button;
+mod shortcut;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -505,7 +507,8 @@ fn main() {
             Some(vec!["--hidden"]),
         ))
         .manage(manager)
-        .manage(comfort::ComfortEngine::default())
+        .manage(mic_tap::spawn())
+        .manage(pairing_button::spawn())
         .setup(move |app| {
             // Set the window icon explicitly so the titlebar and taskbar show it
             // even when the desktop-file association is unavailable (e.g. X11).
@@ -574,7 +577,10 @@ fn main() {
                         #[cfg(unix)]
                         quit_now();
                         #[cfg(not(unix))]
-                        app.exit(0);
+                        {
+                            pairing_button::uninstall();
+                            app.exit(0);
+                        }
                     }
                     _ => {}
                 });
@@ -654,14 +660,12 @@ fn main() {
             commands::set_setting,
             commands::set_tx_setting,
             commands::udev_help,
-            commands::audio_devices,
-            commands::set_audio_device,
-            comfort::comfort_status,
-            comfort::comfort_start,
-            comfort::comfort_stop,
-            comfort::comfort_set,
-            comfort::receiver_shortcut_start,
-            comfort::receiver_shortcut_stop,
+            driver::install_usb_driver,
+            pairing_button::pairing_button_test_active,
+            mic_tap::mic_tap_test_status,
+            shortcut::receiver_shortcut_status,
+            shortcut::receiver_shortcut_start,
+            shortcut::receiver_shortcut_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DJI Mic Control");

@@ -4,9 +4,8 @@
 #
 # Builds the shippable bundles for the host OS and copies only those into
 # Release/<os>/ :
-#     macOS  ->  Release/macos    (.app, .dmg)
 #     Linux  ->  Release/linux    (.deb, .rpm, .AppImage)
-# For Windows, use build-release.ps1.
+# For Windows, use build-release.ps1. macOS is not a supported target.
 #
 # "Safeties on" means every absolute filesystem path Rust would otherwise bake
 # into panic/backtrace strings (which `strip` does NOT remove) is remapped away,
@@ -33,7 +32,6 @@ export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}/=${US}--re
 # --- Host platform -----------------------------------------------------------
 OS="$(uname -s)"
 case "$OS" in
-  Darwin) PLATFORM="macos"; BUNDLES="app,dmg" ;;
   Linux)  PLATFORM="linux"; BUNDLES="deb,rpm,appimage"
           # Let AppImage tooling run by extraction (no FUSE needed on CI hosts).
           export APPIMAGE_EXTRACT_AND_RUN=1
@@ -43,6 +41,7 @@ case "$OS" in
           # profile.release (strip = true) and the vendored system libs ship
           # pre-stripped, so this second strip pass is redundant anyway.
           export NO_STRIP=1 ;;
+  Darwin) echo "ERROR: macOS is not a supported build target in this fork." >&2; exit 1 ;;
   *) echo "ERROR: unsupported OS '$OS' — use build-release.ps1 on Windows." >&2; exit 1 ;;
 esac
 
@@ -80,14 +79,9 @@ copy_glob() { # <dir> <glob>
   fi
 }
 
-if [ "$PLATFORM" = "macos" ]; then
-  copy_glob "$BUNDLE_DIR/macos" "*.app"
-  copy_glob "$BUNDLE_DIR/dmg"   "*.dmg"
-else
-  copy_glob "$BUNDLE_DIR/deb"      "*.deb"
-  copy_glob "$BUNDLE_DIR/rpm"      "*.rpm"
-  copy_glob "$BUNDLE_DIR/appimage" "*.AppImage"
-fi
+copy_glob "$BUNDLE_DIR/deb"      "*.deb"
+copy_glob "$BUNDLE_DIR/rpm"      "*.rpm"
+copy_glob "$BUNDLE_DIR/appimage" "*.AppImage"
 
 # --- Verify no build-machine paths leaked into any shipped file --------------
 # Scans our own binary plus (on Linux) every file linuxdeploy bundled into the
@@ -131,66 +125,56 @@ fi
 # --- ship in BOTH the .deb and .rpm, so the two never drift apart ------------
 UDEV_RULE="60-dji-mic.rules"
 
-if [ "$PLATFORM" = "macos" ]; then
-  APP="$(ls -d "$OUT"/*.app 2>/dev/null | head -1)"
-  if [ -n "$APP" ] && [ -f "$APP/Contents/Resources/icon.icns" ]; then
-    echo "==> Logo present: $(basename "$APP")/Contents/Resources/icon.icns"
+# List a package's payload paths, using whatever tooling the host has.
+deb_contents() {
+  if command -v dpkg-deb >/dev/null 2>&1; then
+    dpkg-deb -c "$1" | awk '{print $NF}'
+  elif command -v ar >/dev/null 2>&1; then
+    ar p "$1" "$(ar t "$1" | grep -m1 '^data\.tar')" | tar tf - 2>/dev/null
+  fi
+}
+rpm_contents() {
+  if command -v rpm >/dev/null 2>&1; then
+    rpm -qlp "$1" 2>/dev/null
+  elif command -v rpm2cpio >/dev/null 2>&1 && command -v cpio >/dev/null 2>&1; then
+    rpm2cpio "$1" | cpio -t 2>/dev/null
+  fi
+}
+
+DEB="$(ls "$OUT"/*.deb 2>/dev/null | head -1)"
+RPM="$(ls "$OUT"/*.rpm 2>/dev/null | head -1)"
+DEB_LIST="$(deb_contents "$DEB")"
+RPM_LIST="$(rpm_contents "$RPM")"
+
+assert_in() { # <label> <listing> <needle> <what>
+  local label="$1" listing="$2" needle="$3" what="$4"
+  if [ -z "$listing" ]; then
+    echo "WARN: cannot inspect $label (no tool); skipped $what check." >&2
+    return 0
+  fi
+  if printf '%s\n' "$listing" | grep -q "$needle"; then
+    echo "==> $label includes $what"
   else
-    echo "ERROR: app logo (Contents/Resources/icon.icns) missing from the .app" >&2
+    echo "ERROR: $label is missing $what ($needle)" >&2
     exit 1
   fi
-else
-  # List a package's payload paths, using whatever tooling the host has.
-  deb_contents() {
-    if command -v dpkg-deb >/dev/null 2>&1; then
-      dpkg-deb -c "$1" | awk '{print $NF}'
-    elif command -v ar >/dev/null 2>&1; then
-      ar p "$1" "$(ar t "$1" | grep -m1 '^data\.tar')" | tar tf - 2>/dev/null
-    fi
-  }
-  rpm_contents() {
-    if command -v rpm >/dev/null 2>&1; then
-      rpm -qlp "$1" 2>/dev/null
-    elif command -v rpm2cpio >/dev/null 2>&1 && command -v cpio >/dev/null 2>&1; then
-      rpm2cpio "$1" | cpio -t 2>/dev/null
-    fi
-  }
+}
 
-  DEB="$(ls "$OUT"/*.deb 2>/dev/null | head -1)"
-  RPM="$(ls "$OUT"/*.rpm 2>/dev/null | head -1)"
-  DEB_LIST="$(deb_contents "$DEB")"
-  RPM_LIST="$(rpm_contents "$RPM")"
+# udev rule parity — the whole point: present in BOTH packages.
+assert_in ".deb" "$DEB_LIST" "$UDEV_RULE"      "the udev rule"
+assert_in ".rpm" "$RPM_LIST" "$UDEV_RULE"      "the udev rule"
+# Same logo shipped by each Linux bundle (hicolor PNG).
+assert_in ".deb" "$DEB_LIST" "hicolor/128x128" "the app logo"
+assert_in ".rpm" "$RPM_LIST" "hicolor/128x128" "the app logo"
 
-  assert_in() { # <label> <listing> <needle> <what>
-    local label="$1" listing="$2" needle="$3" what="$4"
-    if [ -z "$listing" ]; then
-      echo "WARN: cannot inspect $label (no tool); skipped $what check." >&2
-      return 0
-    fi
-    if printf '%s\n' "$listing" | grep -q "$needle"; then
-      echo "==> $label includes $what"
-    else
-      echo "ERROR: $label is missing $what ($needle)" >&2
-      exit 1
-    fi
-  }
-
-  # udev rule parity — the whole point: present in BOTH packages.
-  assert_in ".deb" "$DEB_LIST" "$UDEV_RULE"      "the udev rule"
-  assert_in ".rpm" "$RPM_LIST" "$UDEV_RULE"      "the udev rule"
-  # Same logo shipped by each Linux bundle (hicolor PNG).
-  assert_in ".deb" "$DEB_LIST" "hicolor/128x128" "the app logo"
-  assert_in ".rpm" "$RPM_LIST" "hicolor/128x128" "the app logo"
-
-  # The udev-reload maintainer script must ship in the .deb too (rpm scriptlets
-  # are embedded in the header and always travel with it).
-  if command -v dpkg-deb >/dev/null 2>&1 && [ -n "$DEB" ]; then
-    if dpkg-deb --ctrl-tarfile "$DEB" 2>/dev/null | tar t 2>/dev/null | grep -q 'postinst'; then
-      echo "==> .deb ships a postinst (udev-reload) script"
-    else
-      echo "ERROR: .deb has no postinst script — the udev reload would not run" >&2
-      exit 1
-    fi
+# The udev-reload maintainer script must ship in the .deb too (rpm scriptlets
+# are embedded in the header and always travel with it).
+if command -v dpkg-deb >/dev/null 2>&1 && [ -n "$DEB" ]; then
+  if dpkg-deb --ctrl-tarfile "$DEB" 2>/dev/null | tar t 2>/dev/null | grep -q 'postinst'; then
+    echo "==> .deb ships a postinst (udev-reload) script"
+  else
+    echo "ERROR: .deb has no postinst script — the udev reload would not run" >&2
+    exit 1
   fi
 fi
 

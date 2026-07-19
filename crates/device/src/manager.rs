@@ -66,7 +66,8 @@ pub struct Probe {
     pub present: usize,
     /// Matching devices we could open.
     pub accessible: usize,
-    /// A device was present but could not be opened (likely udev on Linux).
+    /// A device was present but could not be opened (missing udev rule on
+    /// Linux, or missing WinUSB driver on Windows).
     pub permission_issue: bool,
 }
 
@@ -182,7 +183,10 @@ impl DeviceManager {
                             let _ = writeln!(file, "[usb] failed to open {id}: {e:?}");
                         }
                     }
-                    if e.kind() == ErrorKind::PermissionDenied {
+                    // PermissionDenied is Linux's udev-rule case; Unsupported is
+                    // what nusb's Windows backend returns when the interface
+                    // isn't bound to WinUSB yet (see driver::install).
+                    if matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::Unsupported) {
                         permission_issue = true;
                     }
                 }

@@ -1,7 +1,7 @@
 {
   "name": "djimic-gui",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,8 +17,5 @@
     "@tauri-apps/cli": "^2",
     "svelte": "^5",
     "vite": "^8"
-  },
-  "allowScripts": {
-    "fsevents@2.3.3": true
   }
 }

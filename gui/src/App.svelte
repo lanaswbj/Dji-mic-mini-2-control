@@ -3,21 +3,15 @@
   import Sidebar from "./lib/Sidebar.svelte";
   import DevicePanel from "./lib/DevicePanel.svelte";
   import UdevModal from "./lib/UdevModal.svelte";
-  import AudioRouting from "./lib/AudioRouting.svelte";
-  import VoiceComfort from "./lib/VoiceComfort.svelte";
+  import ReceiverShortcut from "./lib/ReceiverShortcut.svelte";
   import {
-    audioDevices,
-    comfortSet,
-    comfortStart,
-    comfortStatus,
-    comfortStop,
-    setAudioDevice,
     snapshot,
     setSetting,
     setTxSetting,
-    receiverShortcutStart,
-    receiverShortcutStop,
     udevHelp,
+    installUsbDriver,
+    pairingButtonTestActive,
+    micTapTestStatus,
   } from "./lib/api.js";
 
   // Custom window chrome. macOS keeps its native traffic lights (via the
@@ -59,15 +53,9 @@
   let error = $state(null);
   let stableStatus = $state(null);
   let refreshInFlight = false;
-  let audio = $state(null);
-  let audioBusy = $state(false);
-  let audioError = $state(null);
-  let audioRefreshInFlight = false;
   let workspace = $state("mic");
-  let comfort = $state(null);
-  let comfortBusy = $state(false);
-  let comfortError = $state(null);
-  let comfortRefreshInFlight = false;
+  let pairingTestActive = $state(false);
+  let tapStatus = $state({ count: 0, active: false, deviceFound: false });
 
   let showUdev = $state(false);
   let help = $state(null);
@@ -109,9 +97,12 @@
   const status = $derived(
     rawStatus && { ...rawStatus, tx: rawStatus.tx.map((tx, i) => applyOptimisticTx(tx, i)) },
   );
-  const linuxAccessIssue = $derived(
-    snap?.os === "linux" && snap?.probe?.permission_issue && devices.length === 0,
-  );
+  // Set on both Linux (missing udev rule) and Windows (missing WinUSB
+  // driver on the receiver's control interface) when a matching device is
+  // on the bus but couldn't be opened.
+  const accessIssue = $derived(snap?.probe?.permission_issue && devices.length === 0);
+  let driverBusy = $state(false);
+  let driverError = $state(null);
 
   function mergeTx(prev, next) {
     if (!next) return null;
@@ -227,85 +218,6 @@
     }
   }
 
-  async function refreshAudio() {
-    if (audioRefreshInFlight) return;
-    audioRefreshInFlight = true;
-    try {
-      audio = await audioDevices();
-      audioError = null;
-    } catch (e) {
-      audioError = String(e);
-    } finally {
-      audioRefreshInFlight = false;
-    }
-  }
-
-  async function changeAudio(kind, device) {
-    if (audioBusy) return;
-    audioBusy = true;
-    audioError = null;
-    try {
-      await setAudioDevice(kind, device);
-      await refreshAudio();
-    } catch (e) {
-      audioError = String(e);
-    } finally {
-      audioBusy = false;
-    }
-  }
-
-  async function refreshComfort() {
-    if (comfortRefreshInFlight) return;
-    comfortRefreshInFlight = true;
-    try {
-      comfort = await comfortStatus();
-    } catch (e) {
-      comfortError = String(e);
-    } finally {
-      comfortRefreshInFlight = false;
-    }
-  }
-
-  async function toggleComfort(start) {
-    if (comfortBusy) return;
-    comfortBusy = true;
-    comfortError = null;
-    try {
-      await (start ? comfortStart() : comfortStop());
-      await new Promise((resolve) => setTimeout(resolve, 180));
-      await refreshComfort();
-    } catch (e) {
-      comfortError = String(e);
-    } finally {
-      comfortBusy = false;
-    }
-  }
-
-  async function changeComfort(parameters) {
-    comfort = { ...comfort, ...parameters };
-    try {
-      await comfortSet(parameters);
-      comfortError = null;
-    } catch (e) {
-      comfortError = String(e);
-    }
-  }
-
-  async function toggleReceiverShortcut(start) {
-    if (comfortBusy) return;
-    comfortBusy = true;
-    comfortError = null;
-    try {
-      await (start ? receiverShortcutStart() : receiverShortcutStop());
-      await new Promise((resolve) => setTimeout(resolve, 180));
-      await refreshComfort();
-    } catch (e) {
-      comfortError = String(e);
-    } finally {
-      comfortBusy = false;
-    }
-  }
-
   function select(id) {
     selected = id;
     userDeselected = id === null;
@@ -379,22 +291,55 @@
     showUdev = true;
   }
 
+  async function fixDriver() {
+    if (driverBusy) return;
+    driverBusy = true;
+    driverError = null;
+    try {
+      await installUsbDriver();
+      await refresh();
+    } catch (e) {
+      driverError = String(e);
+    } finally {
+      driverBusy = false;
+    }
+  }
+
   $effect(() => {
     refresh();
     const timer = setInterval(refresh, 250);
     return () => clearInterval(timer);
   });
 
+  // Poll for the pairing-button press indicator and the mic-tap test status
+  // while the shortcut panel is visible (see gui/src-tauri/src/pairing_button.rs
+  // and mic_tap.rs).
   $effect(() => {
-    refreshAudio();
-    const timer = setInterval(refreshAudio, 3000);
-    return () => clearInterval(timer);
-  });
-
-  $effect(() => {
-    refreshComfort();
-    const timer = setInterval(refreshComfort, 150);
-    return () => clearInterval(timer);
+    if (workspace !== "shortcut") return;
+    let cancelled = false;
+    const tick = async () => {
+      // Independent try/catch per call: one failing (e.g. the mic-tap
+      // audio device not being present yet) must not stop the other from
+      // updating.
+      try {
+        const active = await pairingButtonTestActive();
+        if (!cancelled) pairingTestActive = active;
+      } catch {
+        // ignore — non-Windows
+      }
+      try {
+        const tap = await micTapTestStatus();
+        if (!cancelled) tapStatus = tap;
+      } catch {
+        // ignore — non-Windows
+      }
+    };
+    tick();
+    const timer = setInterval(tick, 150);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   });
 
   // Keep the maximize/restore icon in sync with the window state.
@@ -426,11 +371,10 @@
     </button>
     <div class="workspace-switch" role="tablist" aria-label="工作区">
       <button class:active={workspace === "mic"} onclick={() => (workspace = "mic")} role="tab" aria-selected={workspace === "mic"}>麦克风</button>
-      <button class:active={workspace === "comfort"} onclick={() => (workspace = "comfort")} role="tab" aria-selected={workspace === "comfort"}>人声舒适</button>
+      <button class:active={workspace === "shortcut"} onclick={() => (workspace = "shortcut")} role="tab" aria-selected={workspace === "shortcut"}>接收器快捷键</button>
     </div>
-    <span class="brand" data-tauri-drag-region>{workspace === "comfort" ? "Voice Comfort" : "大疆麦克风控制"}</span>
+    <span class="brand" data-tauri-drag-region>{workspace === "shortcut" ? "接收器快捷键" : "大疆麦克风控制"}</span>
     <div class="drag-fill" data-tauri-drag-region></div>
-    <AudioRouting devices={audio} busy={audioBusy} error={audioError} onchange={changeAudio} onrefresh={refreshAudio} />
 
     {#if !isMac}
       <div class="win-controls">
@@ -453,10 +397,18 @@
     {/if}
   </div>
 
-  {#if linuxAccessIssue}
+  {#if accessIssue && snap?.os === "linux"}
     <button class="banner" onclick={openUdev}>
       已连接麦克风，但当前无权访问。点击修复 USB 权限。
     </button>
+  {:else if accessIssue && snap?.os === "windows"}
+    <button class="banner" onclick={fixDriver} disabled={driverBusy}>
+      {driverBusy ? "正在下载驱动安装向导，请在权限提示中点击“是”，并在弹出的窗口中选择设备后点击 Install Driver…" : "已连接麦克风，但驱动未安装。点击一键修复（需要管理员权限）。"}
+    </button>
+  {/if}
+
+  {#if driverError}
+    <div class="banner err" role="alert">{driverError}</div>
   {/if}
 
   {#if error}
@@ -469,15 +421,8 @@
     </div>
 
     <main class="main">
-      {#if workspace === "comfort"}
-        <VoiceComfort
-          status={comfort}
-          busy={comfortBusy}
-          error={comfortError}
-          ontoggle={toggleComfort}
-          onchange={changeComfort}
-          onshortcuttoggle={toggleReceiverShortcut}
-        />
+      {#if workspace === "shortcut"}
+        <ReceiverShortcut {pairingTestActive} {tapStatus} />
       {:else if selectedDevice && status}
         <DevicePanel
           device={selectedDevice}
@@ -494,10 +439,21 @@
       {:else}
         <div class="placeholder">
           <div class="ph-card">
-            {#if linuxAccessIssue}
+            {#if accessIssue && snap?.os === "linux"}
               <h2>需要授权</h2>
               <p>已连接受支持的麦克风，但应用暂无访问权限。</p>
               <button class="cta" onclick={openUdev}>查看设置步骤</button>
+            {:else if accessIssue && snap?.os === "windows"}
+              <h2>需要安装驱动</h2>
+              <p>
+                已连接受支持的麦克风，但控制接口尚未安装驱动。点击下方按钮会下载官方驱动安装工具
+                Zadig 并以管理员身份启动 —— 在弹出的窗口中从下拉列表选择本设备（型号名中含
+                "Interface 6" 或 "MI_06" 字样），确认驱动类型为 WinUSB，然后点击 Install
+                Driver。安装工具会在成功后自动关闭并被应用删除。
+              </p>
+              <button class="cta" onclick={fixDriver} disabled={driverBusy}>
+                {driverBusy ? "正在下载安装向导…" : "一键修复驱动"}
+              </button>
             {:else if devices.length > 0}
               <h2>未选择设备</h2>
               <p>请从侧边栏选择一个设备。</p>

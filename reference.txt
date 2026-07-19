@@ -1,0 +1,2 @@
+https://github.com/Jayaway/Vibe-Coding-for-DJI-Mic
+https://github.com/hueyluox/dji-mic-command
