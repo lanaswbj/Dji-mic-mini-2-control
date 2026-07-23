@@ -10,6 +10,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 device = { workspace = true }
+tap-model = { workspace = true }
 tauri = { version = "2", features = ["image-png", "tray-icon"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
@@ -22,16 +23,20 @@ signal-hook = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 cpal = "0.15"
-# Silero VAD (neural-net voice activity detector) and spectral-flux onset
-# novelty — see gui/src-tauri/src/mic_tap.rs's module doc comment for why.
-voice_activity_detector = "0.2.1"
-microdsp = "0.1.3"
+# VAD, spectral-flux novelty, and the trained classifier itself all now
+# live behind `tap-model` (see gui/src-tauri/src/mic_tap.rs's module doc
+# comment and crates/tap-model's own doc comment) — no direct dependency
+# on `earshot`/`microdsp` here.
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Threading",
 ] }
 
 [[bin]]

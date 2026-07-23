@@ -1,11 +1,18 @@
 // Hide the console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod claude_status;
 mod commands;
 mod driver;
+mod hook_bridge;
+mod key_inject;
 mod mic_tap;
 mod pairing_button;
+mod permission_server;
+mod pie_menu;
 mod shortcut;
+mod tap_feedback;
+mod volume_guard;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -380,6 +387,43 @@ fn battery_badge_icon(base: &Image<'static>) -> Image<'static> {
     Image::new_owned(rgba, width, height)
 }
 
+/// Colored dot reflecting `claude_status`'s current value, in the
+/// **top-left** corner — deliberately the opposite corner from the
+/// no-signal/battery badges below (bottom-right): those two are "mutually
+/// exclusive in practice" per `battery_badge_icon`'s own doc comment, but a
+/// Claude Code status and a device alert aren't mutually exclusive, so they
+/// need their own space rather than a stacking priority. A plain dot, not a
+/// glyph — there's little room left in a 16-32px tray icon once the
+/// existing bottom-right badges are also in play.
+fn claude_status_badge_icon(base: &Image<'static>, color: [u8; 4]) -> Image<'static> {
+    const WHITE: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
+    let (width, height) = (base.width(), base.height());
+    let mut rgba = base.rgba().to_vec();
+
+    let r = width.min(height) as f32 * 0.26;
+    let (cx, cy) = (r * 0.95, r * 0.95);
+
+    draw_disc(&mut rgba, width, height, cx, cy, r, WHITE);
+    draw_disc(&mut rgba, width, height, cx, cy, r * 0.8, color);
+
+    Image::new_owned(rgba, width, height)
+}
+
+/// Tray badge color for each `ClaudeStatus`. `None` (idle) draws nothing, so
+/// the common case leaves the icon undecorated. First-pass colors, easy to
+/// retune.
+fn claude_status_color(status: claude_status::ClaudeStatus) -> Option<[u8; 4]> {
+    use claude_status::ClaudeStatus::*;
+    match status {
+        Idle => None,
+        Thinking => Some([0x2b, 0x7d, 0xe0, 0xff]),
+        Working => Some([0xe0, 0x9a, 0x2b, 0xff]),
+        NeedsAttention => Some([0x2b, 0xb3, 0x4a, 0xff]),
+        Error => Some([0xe0, 0x2b, 0x2b, 0xff]),
+    }
+}
+
 /// Overlay a small red "no signal" badge (a circle with an "x") in the
 /// bottom-right corner of `base`, returning a new owned icon.
 fn badge_icon(base: &Image<'static>) -> Image<'static> {
@@ -507,8 +551,6 @@ fn main() {
             Some(vec!["--hidden"]),
         ))
         .manage(manager)
-        .manage(mic_tap::spawn())
-        .manage(pairing_button::spawn())
         .setup(move |app| {
             // Set the window icon explicitly so the titlebar and taskbar show it
             // even when the desktop-file association is unavailable (e.g. X11).
@@ -523,6 +565,20 @@ fn main() {
                     let _ = window.show();
                 }
             }
+
+            pie_menu::spawn(app.handle().clone());
+            // mic_tap needs a real AppHandle (to drive the pie menu on a
+            // tap — see its own `spawn` doc comment), which only exists once
+            // we're inside `setup`, so unlike `manager` above it's
+            // registered with `app.manage(...)` here instead of chained on
+            // the builder. pairing_button doesn't need one (see its
+            // `on_press` doc comment) but is kept alongside it here anyway.
+            app.manage(mic_tap::spawn(app.handle().clone()));
+            app.manage(tap_feedback::TapTrainer::spawn(app.handle().clone()));
+            app.manage(pairing_button::spawn());
+            volume_guard::spawn();
+            hook_bridge::spawn(app.handle().clone());
+            permission_server::spawn(app.handle().clone());
 
             // Use the requested SF Symbol as a native macOS template image.
             // Status badges still overlay it, but connected hardware no longer
@@ -579,6 +635,8 @@ fn main() {
                         #[cfg(not(unix))]
                         {
                             pairing_button::uninstall();
+                            pie_menu::uninstall();
+                            volume_guard::uninstall();
                             app.exit(0);
                         }
                     }
@@ -603,6 +661,7 @@ fn main() {
                 let mut last_alert = initial_alert;
                 let mut last_mic2 = initial_mic2;
                 let mut last_battery = initial_battery;
+                let mut last_claude_status = claude_status::get();
                 let mut blink_on = true;
                 loop {
                     let state = menu_state(&handle);
@@ -615,6 +674,7 @@ fn main() {
                     let alert = alert_active(&handle);
                     let mic2 = mic_mini_2_present(&handle);
                     let battery = battery_alert(&handle);
+                    let claude = claude_status::get();
 
                     let icon = if battery == BatteryAlert::Critical {
                         // Repaint every tick regardless of other state changes —
@@ -622,7 +682,11 @@ fn main() {
                         // icon underneath stays put either way).
                         blink_on = !blink_on;
                         icons.pick_with_battery(mic2, alert, battery, blink_on)
-                    } else if battery != last_battery || alert != last_alert || mic2 != last_mic2 {
+                    } else if battery != last_battery
+                        || alert != last_alert
+                        || mic2 != last_mic2
+                        || claude != last_claude_status
+                    {
                         icons.pick_with_battery(mic2, alert, battery, true)
                     } else {
                         None
@@ -630,6 +694,18 @@ fn main() {
                     last_alert = alert;
                     last_mic2 = mic2;
                     last_battery = battery;
+                    last_claude_status = claude;
+
+                    // Composited on the fly each repaint tick (unlike
+                    // mic2/base_alert, which are precomputed once at startup
+                    // since they're static booleans) — Claude Code's status
+                    // changes far more often, the same reasoning
+                    // `battery_badge_icon` already applies live rather than
+                    // precomputing.
+                    let icon = icon.map(|img| match claude_status_color(claude) {
+                        Some(color) => claude_status_badge_icon(&img, color),
+                        None => img,
+                    });
 
                     if let Some(icon) = icon {
                         let h = handle.clone();
@@ -663,6 +739,14 @@ fn main() {
             driver::install_usb_driver,
             pairing_button::pairing_button_test_active,
             mic_tap::mic_tap_test_status,
+            tap_feedback::mic_tap_report_false_positive,
+            tap_feedback::mic_tap_report_false_negative,
+            tap_feedback::mic_tap_training_status,
+            tap_feedback::mic_tap_rollback_model,
+            tap_feedback::mic_tap_restore_factory_model,
+            pie_menu::pie_menu_close,
+            pie_menu::pie_menu_select,
+            pie_menu::pie_menu_answer_question,
             shortcut::receiver_shortcut_status,
             shortcut::receiver_shortcut_start,
             shortcut::receiver_shortcut_stop,

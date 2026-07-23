@@ -19,20 +19,32 @@
 //! Pipeline per audio chunk:
 //! - `RMS`/`PEAK`/`RATIO` (peak vs. a 20-chunk rolling baseline) — basic
 //!   dynamics.
-//! - 4-band Goertzel spectral snapshot (centroid, high/low energy ratio) —
-//!   *timbre*, so loud speech doesn't look like a tap just because it's
-//!   loud.
-//! - Silero VAD (`voice_activity_detector`) — gates tap classification off
+//! - A 12-band Goertzel spectral profile plus rolloff/flatness/attack-shape/
+//!   delta features (see `tap_model::features`) — real spectral *shape*,
+//!   not just the two collapsed centroid/hl_ratio summaries the original
+//!   4-band version produced, so loud speech doesn't look like a tap just
+//!   because it's loud and the classifier can tell "this frequency profile
+//!   is broadband and front-loaded" from "this one trails into harmonics".
+//! - `earshot` (pure-Rust neural-net VAD) — gates tap classification off
 //!   while speech is active; loud/sharp speech can slip past the
-//!   classifier's own features otherwise.
+//!   classifier's own features otherwise. Replaced Silero
+//!   (`voice_activity_detector`, which pulled in `ort` + a build-time-
+//!   downloaded ONNX Runtime purely for this) — see
+//!   `tap_model::features::VadState`'s doc comment for the version-history
+//!   caveat.
 //! - Spectral-flux onset novelty (`microdsp`) — a mature MIR (music
 //!   information retrieval) technique for detecting percussive onsets,
 //!   used as an extra feature rather than another hand-tuned "how sudden
 //!   is this" threshold.
 //! - All of the above feed a small trained neural net (1 hidden layer,
-//!   softmax over none/nail/pad) instead of fixed thresholds — the
-//!   original macOS-reference thresholds never fired on this hardware at
-//!   all.
+//!   optionally with a small 1D-conv path over the band sequence — see
+//!   `tap_model::TapModel`'s doc comment — softmax, binary tap-vs-none)
+//!   instead of fixed thresholds — the original macOS-reference thresholds
+//!   never fired on this hardware at all. The weights/forward-pass/
+//!   training now live in the shared `tap-model` crate as runtime-
+//!   loadable, hot-swappable data instead of compile-time consts — see
+//!   that crate's doc comment, and `tap_feedback` for the incremental-
+//!   training/user-feedback loop built on top of it.
 //! - Hard amplitude/transient floors on top of the model, and a short
 //!   confirm-delay that lets a late-arriving VAD verdict retroactively
 //!   cancel a candidate (the classifier reacts to speech onset before the
@@ -40,10 +52,11 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
+use tap_model::features::{self, NoveltyState, VadState};
 
 /// Set `DJIMIC_DEBUG=1` (same env var `crates/device/src/actor.rs` uses) to
 /// log tap detection and device discovery to stderr.
@@ -70,16 +83,19 @@ const DEBOUNCE: Duration = Duration::from_millis(100);
 const TAP_WINDOW: Duration = Duration::from_millis(450);
 const RMS_WINDOW_LEN: usize = 20;
 
-/// Supplementary hard floors on top of the ML classifier, deliberately set
-/// aggressive: quiet/soft incidental sounds (clothing rustle, footsteps, a
-/// tap several feet away, a light brush of the mic) can still have a
-/// tap-shaped spectrum and slip past the model, but they're both quieter
-/// and less sharply transient than someone deliberately, firmly tapping the
-/// mic shell. Trading sensitivity for precision here on purpose — a missed
-/// light tap is much less annoying than a random false trigger while
-/// talking or moving around.
-const HARD_PEAK_FLOOR: f32 = 600.0;
-const HARD_RATIO_FLOOR: f32 = 10.0;
+/// Supplementary hard floors on top of the ML classifier — a nominal safety
+/// net against literal silence/near-zero readings, not the primary filter.
+/// Used to be much more aggressive (peak>600, ratio>10) to reject quiet/soft
+/// incidental sounds the model might slip on, but an offline held-out sweep
+/// over the full recorded dataset found that retraining on *cleaned* labels
+/// (see `tap-model`/`test-tools/detect-test`'s `TRAIN_CLEAN_PEAK_MIN`) plus a
+/// higher confidence threshold gave the classifier itself that job just as
+/// well, and the old floors were mostly rejecting genuine soft-but-real taps
+/// instead. Tune down further (independently) if genuine firm taps still
+/// don't register; tune back up if false triggers from ambient noise become
+/// a problem in practice.
+const HARD_PEAK_FLOOR: f32 = 150.0;
+const HARD_RATIO_FLOOR: f32 = 1.5;
 /// Crest factor (peak / rms *within this one chunk*) turned out to be an
 /// unreliable gate in practice — genuine taps measured anywhere from 1.6 to
 /// 9+ against real hardware. Left in place but set near its mathematical
@@ -97,280 +113,46 @@ const HARD_CREST_FLOOR: f32 = 1.2;
 /// Kept short so it doesn't eat into legitimate fast double/triple taps.
 const TAP_CONFIRM_DELAY: Duration = Duration::from_millis(150);
 
+/// A candidate only confirms if `ratio` dropped to at most this fraction of
+/// its own peak (recorded when the candidate was raised) at some point
+/// before `TAP_CONFIRM_DELAY` elapses — see `PendingTap::seen_decay`.
+/// Targets continuous noise a single audio-chunk snapshot can otherwise
+/// mistake for a tap (blowing on the mic, rubbing/scrubbing it): both stay
+/// loud for hundreds of milliseconds, while a real mechanical tap's
+/// shell-resonance ring-down dies out fast. Deliberately self-relative to
+/// each candidate's own peak rather than the slow 20-chunk rolling baseline
+/// `HARD_RATIO_FLOOR` compares against — an earlier, baseline-relative
+/// version of this idea ("has it gone quiet since the last tap") was tried
+/// and removed for blocking legitimate rapid double/triple taps, since that
+/// baseline stays elevated through a fast burst. This version doesn't have
+/// that problem: each candidate's decay is judged only against its own
+/// starting peak, so a second real tap re-elevating the signal shortly after
+/// doesn't retroactively undo the first candidate's own already-observed
+/// decay.
+const SUSTAIN_DECAY_FRACTION: f32 = 0.5;
+
 /// How long the frontend should consider a finalized tap group "active", so
 /// a quick poll-based UI can still catch a momentary flash.
 const ACTIVE_WINDOW: Duration = Duration::from_millis(700);
 
-/// This device's audio config sample rate (confirmed via `DJIMIC_DEBUG=1`
-/// logging — `[mic_tap] opening ... rate=48000`), used to place the
-/// Goertzel analysis bins in `spectral_features`. Hardcoded rather than
-/// threaded through every call site since this specific receiver has only
-/// ever been observed at this rate.
-const SAMPLE_RATE_HZ: f32 = 48000.0;
-
 // ---------------------------------------------------------------------
-// Trained classifier — 1 hidden layer, tanh activation, softmax output
-// over 3 classes, trained on real recorded data from this receiver (see
-// test-tools/detect-test's `collect`/`train` subcommands). Replaces the
-// hand-tuned peak/ratio thresholds ported from the macOS reference
-// (guessed for different hardware, never fired on this mic).
+// Trained classifier — weights/forward-pass/training live in the shared
+// `tap-model` crate now (see its doc comment) as runtime-loadable, hot-
+// swappable data instead of compile-time consts. `class != 0` is "a tap";
+// an earlier version split taps into fingernail/fingertip-pad sub-classes
+// purely as a training-data trick, but nothing downstream ever branched on
+// which — merging them into a true binary target measurably improved real
+// recall (see test-tools/detect-test's `run_train` doc comment). Feature
+// extraction (Goertzel bands, novelty, VAD) also now lives in
+// `tap_model::features`, shared with `test-tools/detect-test` — see that
+// module's doc comment.
 // ---------------------------------------------------------------------
 
-/// Classes: `0 = not a tap, 1 = fingernail tap, 2 = fingertip-pad tap`. The
-/// nail/pad split is purely a training-data trick to give the model a
-/// cleaner decision boundary — both count as "a tap" once classified (see
-/// `class != 0` below), there's no separate nail/pad gesture exposed.
-/// Feature order: `[ln(peak), ln(rms), ln(ratio), zcr, ln(crest),
-/// centroid/1000, ln(high/low band ratio), ln(novelty)]`.
-const N_FEATURES: usize = 8;
-const N_HIDDEN: usize = 8;
-const N_CLASSES: usize = 3;
-
-const TAP_W1: [[f32; N_HIDDEN]; N_FEATURES] = [
-    [0.135535, -0.076446, 0.004948, -0.180434, -0.095998, -0.385457, -0.022245, 0.054475],
-    [0.105033, 0.028647, -0.252446, -0.179555, 0.018818, -0.714688, 0.069344, 0.010913],
-    [-0.322777, -0.131798, 0.797818, 0.207440, -0.011429, 0.736934, -0.260370, 0.334038],
-    [-0.193070, -0.233307, -0.248121, -0.247495, -0.139189, -0.420904, 0.065982, -0.067548],
-    [0.322476, 0.073638, 0.093224, -0.209518, -0.147059, 0.053186, -0.253215, 0.105858],
-    [-0.146326, -0.114495, -0.485083, -0.403872, -0.261615, 0.108842, 0.157607, 0.025234],
-    [-0.274176, 0.176817, -0.383225, -0.228265, 0.347999, -0.196006, -0.456033, -0.172476],
-    [0.026121, -0.094991, 0.253257, 0.274173, -0.321361, 0.050310, 0.256826, -0.188330],
-];
-const TAP_B1: [f32; N_HIDDEN] =
-    [0.567922, 0.154472, -0.102371, 0.207297, -0.108343, -0.483559, 1.251333, -0.455840];
-const TAP_W2: [[f32; N_CLASSES]; N_HIDDEN] = [
-    [0.794097, -0.320796, -0.402413],
-    [0.136090, 0.073055, -0.090941],
-    [-0.916578, 0.598011, 0.592258],
-    [0.030284, -0.725793, 0.337637],
-    [-0.354197, 0.270782, -0.209570],
-    [-0.562380, -0.892894, 1.114725],
-    [1.339380, -0.600914, -0.769204],
-    [-0.429989, 0.299540, 0.460390],
-];
-const TAP_B2: [f32; N_CLASSES] = [1.225891, -0.418108, -0.807783];
-const TAP_MEAN: [f32; N_FEATURES] =
-    [5.097567, 4.183465, 0.977682, 0.039682, 0.914110, 0.877099, -2.485912, -6.234169];
-const TAP_STD: [f32; N_FEATURES] =
-    [1.298908, 1.282411, 0.760981, 0.039219, 0.170054, 0.516419, 1.077319, 1.391290];
-/// Raised from the model's natural 0.5 decision boundary — same reasoning
-/// as the hard floors above, demand a confidently unambiguous "yes" rather
-/// than a bare majority.
-const TAP_CONFIDENCE_THRESHOLD: f32 = 0.55;
-
-const TAP_CLASS_NAMES: [&str; N_CLASSES] = ["none", "指甲", "指腹"];
-
-/// Goertzel algorithm: signal magnitude at one target frequency, without
-/// needing a full FFT (or an FFT crate) for just a handful of bins.
-fn goertzel_magnitude(samples: &[i16], target_hz: f32) -> f32 {
-    if samples.len() < 8 {
-        return 0.0;
-    }
-    let n = samples.len() as f32;
-    let k = (0.5 + n * target_hz / SAMPLE_RATE_HZ).floor();
-    let omega = 2.0 * std::f32::consts::PI * k / n;
-    let coeff = 2.0 * omega.cos();
-    let (mut s_prev, mut s_prev2) = (0.0f32, 0.0f32);
-    for &sample in samples {
-        let s = sample as f32 + coeff * s_prev - s_prev2;
-        s_prev2 = s_prev;
-        s_prev = s;
-    }
-    (s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2)
-        .max(0.0)
-        .sqrt()
-}
-
-/// Crude 4-band spectral snapshot (returns `(centroid_hz, high/low energy
-/// ratio)`) — gives the classifier a sense of *timbre* instead of only
-/// amplitude/dynamics: a hard knock on the mic shell is a broadband,
-/// high-frequency-heavy transient, while voiced speech concentrates energy
-/// in low harmonics even when it's loud.
-fn spectral_features(samples: &[i16]) -> (f32, f32) {
-    const BANDS: [f32; 4] = [300.0, 1000.0, 3000.0, 6000.0];
-    let mags: [f32; 4] = std::array::from_fn(|i| goertzel_magnitude(samples, BANDS[i]));
-    let total: f32 = mags.iter().sum::<f32>().max(1e-6);
-    let centroid = BANDS.iter().zip(mags.iter()).map(|(f, m)| f * m).sum::<f32>() / total;
-    let low = mags[0] + mags[1];
-    let high = mags[2] + mags[3];
-    let hl_ratio = high / low.max(1e-6);
-    (centroid, hl_ratio)
-}
-
-/// Spectral-flux based onset novelty (`microdsp::sfnov`) — a mature MIR
-/// technique for detecting percussive onsets, the same family of algorithm
-/// behind tools like aubio/essentia's onset detectors. Measures
-/// frame-to-frame *change* in the spectrum, targeting "how sudden is this
-/// attack" more reliably than the crest-factor attempt above.
-struct NoveltyState {
-    detector: microdsp::sfnov::SpectralFluxNoveltyDetector<microdsp::sfnov::HardKneeCompression>,
-    last_novelty: f32,
-}
-
-/// Onset detector's internal analysis window. Smaller = lower latency but
-/// less frequency resolution; 512 samples at 48kHz is ~10.7ms.
-const NOVELTY_WINDOW_SIZE: usize = 512;
-
-impl Default for NoveltyState {
-    fn default() -> Self {
-        NoveltyState {
-            detector: microdsp::sfnov::SpectralFluxNoveltyDetector::new(NOVELTY_WINDOW_SIZE),
-            last_novelty: 0.0,
-        }
-    }
-}
-
-impl NoveltyState {
-    fn update(&mut self, samples: &[i16]) -> f32 {
-        let float_samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-        let mut latest = self.last_novelty;
-        self.detector.process(&float_samples, |flux| {
-            latest = flux.novelty();
-        });
-        self.last_novelty = latest;
-        latest
-    }
-}
-
-/// Turns raw per-chunk measurements into the model's input vector.
-fn build_feature_vector(
-    peak: f32,
-    rms: f32,
-    ratio: f32,
-    zcr: f32,
-    centroid: f32,
-    hl_ratio: f32,
-    novelty: f32,
-) -> [f32; N_FEATURES] {
-    let crest = (peak / rms.max(1.0)).max(1.0);
-    [
-        peak.max(1.0).ln(),
-        rms.max(1.0).ln(),
-        ratio.max(1.0).ln(),
-        zcr,
-        crest.ln(),
-        centroid / 1000.0,
-        hl_ratio.max(1e-3).ln(),
-        novelty.max(1e-4).ln(),
-    ]
-}
-
-fn softmax(logits: [f32; N_CLASSES]) -> [f32; N_CLASSES] {
-    let max = logits.iter().cloned().fold(f32::MIN, f32::max);
-    let exps: [f32; N_CLASSES] = std::array::from_fn(|k| (logits[k] - max).exp());
-    let sum: f32 = exps.iter().sum::<f32>().max(1e-9);
-    std::array::from_fn(|k| exps[k] / sum)
-}
-
-/// Class probabilities `[none, nail, pad]` for one audio chunk, per the
-/// trained model.
-fn tap_class_probabilities(features: [f32; N_FEATURES]) -> [f32; N_CLASSES] {
-    let x: [f32; N_FEATURES] =
-        std::array::from_fn(|i| (features[i] - TAP_MEAN[i]) / TAP_STD[i]);
-    let hidden: [f32; N_HIDDEN] = std::array::from_fn(|j| {
-        let mut sum = TAP_B1[j];
-        for i in 0..N_FEATURES {
-            sum += x[i] * TAP_W1[i][j];
-        }
-        sum.tanh()
-    });
-    let logits: [f32; N_CLASSES] = std::array::from_fn(|k| {
-        let mut z = TAP_B2[k];
-        for j in 0..N_HIDDEN {
-            z += hidden[j] * TAP_W2[j][k];
-        }
-        z
-    });
-    softmax(logits)
-}
-
-/// The most likely class and its probability, per [`tap_class_probabilities`].
-fn tap_predict(features: [f32; N_FEATURES]) -> (usize, f32) {
-    let probs = tap_class_probabilities(features);
-    let (idx, &p) = probs
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap();
-    (idx, p)
-}
-
-// ---------------------------------------------------------------------
-// Speech gating: the tap classifier alone still occasionally reads a sharp
-// consonant or loud exclamation as a tap, since its features are single
-// small-frame amplitude/spectral snapshots, not a real model of speech.
-// Running a dedicated voice-activity detector alongside it and suppressing
-// tap classification while it reports speech closes that gap.
-// ---------------------------------------------------------------------
-
-/// Silero VAD operates on 16kHz mono, 512-sample (32ms) frames; this device
-/// captures at 48kHz, so every 3rd raw sample is kept (after a one-pole
-/// low-pass to avoid aliasing high-frequency speech content into noise the
-/// VAD can't read).
-const VAD_DOWNSAMPLE_RATIO: usize = 3;
-const VAD_FRAME_LEN: usize = 512;
-/// alpha = 1 - exp(-2*pi*fc/fs) for fc=7000Hz, fs=48000Hz.
-const VAD_LOWPASS_ALPHA: f32 = 0.6;
-/// Leans below Silero's usual ~0.5 default: false-negatives here (real
-/// speech scored as non-speech) let the tap classifier's own speech/tap
-/// confusion through, which matters more in practice than occasionally
-/// gating out a real tap.
-const VAD_SCORE_THRESHOLD: f32 = 0.35;
-/// How long tap detection stays suppressed after the last speech frame —
-/// covers the brief pauses within a sentence so the gate doesn't flicker
-/// open between words.
-const VAD_HOLDOVER: Duration = Duration::from_millis(450);
-
-struct VadState {
-    detector: voice_activity_detector::VoiceActivityDetector,
-    lp_state: f32,
-    sample_counter: u64,
-    frame_buf: Vec<i16>,
-    speech_until: Option<Instant>,
-    last_score: f32,
-}
-
-impl Default for VadState {
-    fn default() -> Self {
-        let detector = voice_activity_detector::VoiceActivityDetector::builder()
-            .sample_rate(16_000)
-            .chunk_size(VAD_FRAME_LEN)
-            .build()
-            .expect("failed to build Silero VAD detector");
-        VadState {
-            detector,
-            lp_state: 0.0,
-            sample_counter: 0,
-            frame_buf: Vec::new(),
-            speech_until: None,
-            last_score: 0.0,
-        }
-    }
-}
-
-impl VadState {
-    fn update(&mut self, samples: &[i16], now: Instant) {
-        for &s in samples {
-            self.lp_state += VAD_LOWPASS_ALPHA * (s as f32 - self.lp_state);
-            self.sample_counter += 1;
-            if self.sample_counter % VAD_DOWNSAMPLE_RATIO as u64 == 0 {
-                self.frame_buf.push(self.lp_state.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
-            }
-        }
-
-        while self.frame_buf.len() >= VAD_FRAME_LEN {
-            let frame: Vec<i16> = self.frame_buf[..VAD_FRAME_LEN].to_vec();
-            self.last_score = self.detector.predict(frame);
-            if self.last_score > VAD_SCORE_THRESHOLD {
-                self.speech_until = Some(now + VAD_HOLDOVER);
-            }
-            self.frame_buf.drain(0..VAD_FRAME_LEN);
-        }
-    }
-
-    fn is_speech(&self, now: Instant) -> bool {
-        self.speech_until.is_some_and(|t| now < t)
-    }
+/// Thin wrapper over `tap_model::TapModel::predict` — kept so call sites
+/// read the same as before the model moved out to the shared crate.
+fn tap_predict(model: &tap_model::TapModel, features: [f32; features::N_FEATURES]) -> (usize, f32) {
+    let result = model.predict(&features);
+    (result.class, result.confidence)
 }
 
 /// Matches the Windows audio input device name against the receiver. Its
@@ -385,6 +167,25 @@ pub struct MicTapWatcher {
     last_group_count: AtomicU8,
     last_group_millis: AtomicU64,
     device_found: AtomicBool,
+    /// Lets a finalized tap group drive the pie menu (see `finalize_group`)
+    /// — open it on a double-tap while closed, or move the highlight
+    /// right/left on a single/double tap while it's already open.
+    app: tauri::AppHandle,
+    /// Hot-swappable live model — `process_chunk` calls `.current()` once
+    /// per chunk; a background poll thread (see `spawn`) and
+    /// `tap_feedback`'s incremental trainer both call `.swap()` from
+    /// entirely different threads with no locking on the read path.
+    pub(crate) model: Arc<tap_model::TapModelStore>,
+    /// Every chunk's raw measurements, unconditionally — including chunks
+    /// that never fired a candidate at all (VAD-suppressed, below the hard
+    /// floors, etc.) — so `tap_feedback`'s false-negative reporting can
+    /// still find a real acoustic event even when the pipeline itself never
+    /// raised one.
+    pub(crate) ring: Arc<crate::tap_feedback::FeedbackRing>,
+    /// Confirm instants of the most recently finalized tap group, for
+    /// `tap_feedback::report_false_positive` to target — cleared/replaced
+    /// wholesale on every new `finalize_group` call, not accumulated.
+    pub(crate) last_group_taps: Mutex<Vec<Instant>>,
 }
 
 #[derive(Serialize)]
@@ -409,10 +210,30 @@ impl MicTapWatcher {
 
     /// Only single and double taps are reported — a burst of 3+ still
     /// counts as a double tap rather than becoming a third gesture.
-    fn finalize_group(&self, count: u32) {
+    ///
+    /// Also drives the pie menu: while it's closed, a double tap opens it.
+    /// While it's already open, a single tap moves the highlight right
+    /// (wrapping back to the first slot past the last one — see
+    /// `PieMenu.svelte`'s `move`); double tap no longer moves it left. A
+    /// double tap that misfires as a single tap while navigating is common
+    /// with this classifier in practice, so relying on it to distinguish
+    /// left from right while open was unreliable — the single-tap-with-
+    /// wraparound scheme reaches every slot without ever needing a double
+    /// tap to be recognized correctly mid-navigation; double tap's only
+    /// remaining job is the (reliable in practice) closed -> open trigger.
+    fn finalize_group(&self, count: u32, taps: Vec<Instant>) {
         let reported = count.min(2);
         self.last_group_count.store(reported as u8, Ordering::Relaxed);
         self.last_group_millis.store(now_millis(), Ordering::Relaxed);
+        *self.last_group_taps.lock().unwrap() = taps;
+
+        if crate::pie_menu::is_showing(&self.app) {
+            if reported == 1 {
+                crate::pie_menu::navigate(&self.app, 1);
+            }
+        } else if reported == 2 {
+            crate::pie_menu::open_if_closed(&self.app);
+        }
     }
 }
 
@@ -426,6 +247,19 @@ fn now_millis() -> u64 {
 struct PendingTap {
     detected_at: Instant,
     class: usize,
+    /// `ratio` at the moment this candidate was raised — the yardstick
+    /// `seen_decay` compares later chunks against.
+    peak_ratio: f32,
+    /// Set once `ratio` has dropped to `SUSTAIN_DECAY_FRACTION` of
+    /// `peak_ratio` at some point since this candidate started. A real
+    /// mechanical tap's ring-down dies out within a few chunks even during a
+    /// fast multi-tap burst (the next tap's own impact re-elevates the
+    /// signal, but only after this has already flipped true); continuous
+    /// noise like blowing on the mic or rubbing/scrubbing it stays elevated
+    /// the whole confirm window and never flips it. See the confirm loop in
+    /// `process_chunk`, which rejects candidates that reach confirm time
+    /// still `false`.
+    seen_decay: bool,
 }
 
 #[derive(Default)]
@@ -442,6 +276,17 @@ struct DetectionState {
     /// third) real tap needs its own candidate slot instead of being
     /// silently dropped while the first is still pending.
     pending_taps: Vec<PendingTap>,
+    /// Confirm instants of every tap in the current burst, so
+    /// `finalize_group` can pass the whole group to
+    /// `MicTapWatcher::last_group_taps` for `tap_feedback`'s false-positive
+    /// reporting to target.
+    group_taps: Vec<Instant>,
+    /// Previous chunk's `ratio`/`ln(novelty)`, for the delta-features in
+    /// `tap_model::features::build_feature_vector` — `None` on the very
+    /// first chunk, treated as "no change" (delta 0) rather than a spurious
+    /// jump from an arbitrary baseline.
+    prev_ratio: Option<f32>,
+    prev_ln_novelty: Option<f32>,
 }
 
 fn rms(samples: &[i16]) -> f32 {
@@ -484,16 +329,21 @@ fn zero_crossing_rate(samples: &[i16]) -> f32 {
 
 /// Process one mono chunk of samples, updating detection state and
 /// finalizing/reporting a tap group through `watcher` as needed.
-/// How long after a detected pairing-button press to suppress tap
-/// detection — the button's own mechanical click is picked up by the mic
-/// and otherwise reads as a shell tap.
+/// How long after the press/release *edges* to suppress tap detection, on
+/// top of suppressing for the entire held-down span (`pairing_button::is_held`)
+/// — the button's own mechanical click is picked up by the mic and
+/// otherwise reads as a shell tap, on both the press click and the release
+/// click, neither of which is covered by `is_held` alone (press hasn't
+/// registered as held yet on the very first chunk; release has already
+/// flipped `is_held` back to false).
 const BUTTON_TAP_SUPPRESS_WINDOW: Duration = Duration::from_millis(300);
 
 fn process_chunk(watcher: &MicTapWatcher, state: &mut DetectionState, samples: &[i16]) {
     let now = Instant::now();
     state.vad.update(samples, now);
     let speech = state.vad.is_speech(now);
-    let button_pressed = crate::pairing_button::recently_pressed(BUTTON_TAP_SUPPRESS_WINDOW);
+    let button_pressed = crate::pairing_button::is_held()
+        || crate::pairing_button::recently_pressed(BUTTON_TAP_SUPPRESS_WINDOW);
     let suppressed = speech || button_pressed;
 
     let r = rms(samples);
@@ -506,10 +356,47 @@ fn process_chunk(watcher: &MicTapWatcher, state: &mut DetectionState, samples: &
     }
     let baseline = median(&state.rms_window).max(1.0);
     let ratio = p / baseline;
-    let (centroid, hl_ratio) = spectral_features(samples);
+    let bands = features::spectral_bands(samples);
     let novelty = state.novelty.update(samples);
-    let (class, confidence) =
-        tap_predict(build_feature_vector(p, r, ratio, zcr, centroid, hl_ratio, novelty));
+    let (attack_pos, energy_skew) = features::attack_shape(samples);
+    let ln_novelty = novelty.max(1e-4).ln();
+    let delta_ratio = ratio.max(1.0).ln() - state.prev_ratio.unwrap_or(ratio).max(1.0).ln();
+    let delta_novelty = ln_novelty - state.prev_ln_novelty.unwrap_or(ln_novelty);
+    state.prev_ratio = Some(ratio);
+    state.prev_ln_novelty = Some(ln_novelty);
+
+    // Recorded unconditionally, before any suppression/floor branching below
+    // — a tap the VAD gate suppressed or the hard floors rejected is exactly
+    // the case `tap_feedback`'s false-negative reporting needs to still find
+    // a real acoustic event for.
+    watcher.ring.push(crate::tap_feedback::CapturedChunk {
+        at: now,
+        peak: p,
+        rms: r,
+        ratio,
+        zcr,
+        novelty,
+        bands,
+        attack_pos,
+        energy_skew,
+        delta_ratio,
+        delta_novelty,
+    });
+
+    let model = watcher.model.current();
+    let feature_vector =
+        features::build_feature_vector(p, r, ratio, zcr, novelty, &bands, attack_pos, energy_skew, delta_ratio, delta_novelty);
+    let (class, confidence) = tap_predict(&model, feature_vector);
+    let class_name = |c: usize| model.class_names.get(c).map(String::as_str).unwrap_or("?");
+
+    // Every pending candidate watches every subsequent chunk for its own
+    // decay, regardless of what else is happening this chunk — see
+    // `PendingTap::seen_decay`.
+    for pending in &mut state.pending_taps {
+        if !pending.seen_decay && ratio < pending.peak_ratio * SUSTAIN_DECAY_FRACTION {
+            pending.seen_decay = true;
+        }
+    }
 
     // The moment VAD catches up and flags speech, or the pairing button was
     // just pressed, cancel every candidate still waiting to be confirmed —
@@ -521,7 +408,7 @@ fn process_chunk(watcher: &MicTapWatcher, state: &mut DetectionState, samples: &
             for pending in &state.pending_taps {
                 eprintln!(
                     "[mic_tap] cancelled pending {} — {}",
-                    TAP_CLASS_NAMES[pending.class],
+                    class_name(pending.class),
                     if button_pressed { "pairing button pressed".to_string() } else { format!("VAD caught up (score={:.2})", state.vad.last_score) }
                 );
             }
@@ -546,7 +433,7 @@ fn process_chunk(watcher: &MicTapWatcher, state: &mut DetectionState, samples: &
     // slot rather than being dropped because "one's already pending".
     if warmed_up
         && class != 0
-        && confidence > TAP_CONFIDENCE_THRESHOLD
+        && confidence > model.confidence_threshold
         && !debounced
         && !suppressed
         && loud_enough
@@ -554,22 +441,27 @@ fn process_chunk(watcher: &MicTapWatcher, state: &mut DetectionState, samples: &
         if debug_enabled() {
             eprintln!(
                 "[mic_tap] candidate {} conf={confidence:.2} peak={p:.0} ratio={ratio:.1} novelty={novelty:.3} — waiting {TAP_CONFIRM_DELAY:?} to confirm",
-                TAP_CLASS_NAMES[class]
+                class_name(class)
             );
         }
-        state.pending_taps.push(PendingTap { detected_at: now, class });
+        state.pending_taps.push(PendingTap {
+            detected_at: now,
+            class,
+            peak_ratio: ratio,
+            seen_decay: false,
+        });
         state.debounce_until = Some(now + DEBOUNCE);
     } else if debug_enabled()
         && warmed_up
         && class != 0
-        && confidence > TAP_CONFIDENCE_THRESHOLD
+        && confidence > model.confidence_threshold
         && !debounced
         && !suppressed
         && !loud_enough
     {
         eprintln!(
             "[mic_tap] too quiet/soft, ignored: class={} conf={confidence:.2} peak={p:.0} (need >{HARD_PEAK_FLOOR}) ratio={ratio:.1} (need >{HARD_RATIO_FLOOR}) crest={crest:.1} (need >{HARD_CREST_FLOOR}) novelty={novelty:.3}",
-            TAP_CLASS_NAMES[class]
+            class_name(class)
         );
     }
 
@@ -577,9 +469,19 @@ fn process_chunk(watcher: &MicTapWatcher, state: &mut DetectionState, samples: &
     // oldest first — usually at most one per call, but a burst of rapid
     // taps can confirm several in the same chunk.
     while state.pending_taps.first().is_some_and(|p| now.duration_since(p.detected_at) >= TAP_CONFIRM_DELAY) {
-        let class = state.pending_taps.remove(0).class;
+        let pending = state.pending_taps.remove(0);
+        if !pending.seen_decay {
+            if debug_enabled() {
+                eprintln!(
+                    "[mic_tap] rejected {} — never decayed, looks like sustained noise (blow/rub) not a tap",
+                    class_name(pending.class)
+                );
+            }
+            continue;
+        }
+        let class = pending.class;
         if debug_enabled() {
-            eprintln!("[mic_tap] confirmed {}", TAP_CLASS_NAMES[class]);
+            eprintln!("[mic_tap] confirmed {}", class_name(class));
         }
         let within_window = state.last_tap.is_some_and(|t| now.duration_since(t) <= TAP_WINDOW);
         if within_window {
@@ -589,10 +491,11 @@ fn process_chunk(watcher: &MicTapWatcher, state: &mut DetectionState, samples: &
                 if debug_enabled() {
                     eprintln!("[mic_tap] group finalized: {} tap(s)", state.tap_count);
                 }
-                watcher.finalize_group(state.tap_count);
+                watcher.finalize_group(state.tap_count, std::mem::take(&mut state.group_taps));
             }
             state.tap_count = 1;
         }
+        state.group_taps.push(now);
         state.last_tap = Some(now);
     }
 
@@ -601,18 +504,88 @@ fn process_chunk(watcher: &MicTapWatcher, state: &mut DetectionState, samples: &
             if debug_enabled() {
                 eprintln!("[mic_tap] group finalized: {} tap(s)", state.tap_count);
             }
-            watcher.finalize_group(state.tap_count);
+            watcher.finalize_group(state.tap_count, std::mem::take(&mut state.group_taps));
             state.tap_count = 0;
         }
     }
 }
 
+/// Resolves to the same physical folder `tap-model`'s own
+/// `app_data_dir()` fallback would (used by `test-tools/detect-test`, which
+/// has no `AppHandle`) — prefers Tauri's own path resolver since it's the
+/// canonical, futureproof API, falling back to the hand-rolled `%APPDATA%`
+/// lookup only if that ever fails.
+pub(crate) fn model_file_path(app: &tauri::AppHandle) -> std::path::PathBuf {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .or_else(tap_model::app_data_dir)
+        .unwrap_or_default();
+    dir.join("tap_model.json")
+}
+
+/// How often the background thread checks whether `tap_model.json` changed
+/// on disk (a full retrain via `detect-test`, or `tap_feedback`'s own
+/// incremental update) — matches the codebase's existing 1-2s poll cadences
+/// elsewhere rather than pulling in a filesystem-watcher crate for
+/// something this infrequent.
+const MODEL_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Watches `tap_model.json`'s mtime and hot-swaps the live model in when it
+/// changes — no restart, no dropped audio frames. A bad/corrupt/schema-
+/// mismatched file is just ignored (validated inside `load_from_file`),
+/// leaving whatever's currently live untouched; see `tap_model`'s own doc
+/// comment for the full edge-case list.
+fn spawn_model_poll(model: Arc<tap_model::TapModelStore>, path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let mut last_modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        loop {
+            std::thread::sleep(MODEL_POLL_INTERVAL);
+            let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            if last_modified.is_some_and(|prev| prev == modified) {
+                continue;
+            }
+            last_modified = Some(modified);
+            match tap_model::TapModel::load_from_file(&path) {
+                Ok(new_model) => {
+                    if debug_enabled() {
+                        eprintln!(
+                            "[mic_tap] hot-swapped model from {} (source={:?}, rows={})",
+                            path.display(),
+                            new_model.source,
+                            new_model.training_rows
+                        );
+                    }
+                    model.swap(new_model);
+                }
+                Err(e) => {
+                    if debug_enabled() {
+                        eprintln!("[mic_tap] ignoring invalid {}: {e}", path.display());
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(windows)]
-pub fn spawn() -> Arc<MicTapWatcher> {
+pub fn spawn(app: tauri::AppHandle) -> Arc<MicTapWatcher> {
+    let path = model_file_path(&app);
+    let model = Arc::new(tap_model::TapModelStore::new(tap_model::TapModel::load_or_default(&path)));
+    spawn_model_poll(model.clone(), path);
+
     let watcher = Arc::new(MicTapWatcher {
         last_group_count: AtomicU8::new(0),
         last_group_millis: AtomicU64::new(0),
         device_found: AtomicBool::new(false),
+        app,
+        model,
+        ring: Arc::new(crate::tap_feedback::FeedbackRing::new()),
+        last_group_taps: Mutex::new(Vec::new()),
     });
     let watcher_thread = watcher.clone();
     std::thread::spawn(move || win32::run(watcher_thread));
@@ -620,11 +593,19 @@ pub fn spawn() -> Arc<MicTapWatcher> {
 }
 
 #[cfg(not(windows))]
-pub fn spawn() -> Arc<MicTapWatcher> {
+pub fn spawn(app: tauri::AppHandle) -> Arc<MicTapWatcher> {
+    let path = model_file_path(&app);
+    let model = Arc::new(tap_model::TapModelStore::new(tap_model::TapModel::load_or_default(&path)));
+    spawn_model_poll(model.clone(), path);
+
     Arc::new(MicTapWatcher {
         last_group_count: AtomicU8::new(0),
         last_group_millis: AtomicU64::new(0),
         device_found: AtomicBool::new(false),
+        app,
+        model,
+        ring: Arc::new(crate::tap_feedback::FeedbackRing::new()),
+        last_group_taps: Mutex::new(Vec::new()),
     })
 }
 

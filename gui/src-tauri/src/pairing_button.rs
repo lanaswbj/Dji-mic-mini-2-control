@@ -34,7 +34,7 @@
 //! appears to be a direct hardware power toggle with no host-visible short
 //! press event, so it isn't handled here.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +47,15 @@ const ACTIVE_WINDOW: Duration = Duration::from_millis(700);
 /// (most multimedia keyboards do).
 const VID: u32 = 0x2ca3;
 const PID: u32 = 0x4011;
+
+/// Set `DJIMIC_DEBUG=1` (same env var `mic_tap.rs` and `crates/device`
+/// use) to log press/release events here — lets them be lined up against
+/// `mic_tap.rs`'s own `[mic_tap]` lines in the same combined stderr stream
+/// to check whether a tap detection actually coincides with a button press,
+/// instead of guessing.
+fn debug_enabled() -> bool {
+    std::env::var_os("DJIMIC_DEBUG").is_some()
+}
 
 pub struct PairingButtonWatcher {
     last_press_millis: AtomicU64,
@@ -62,14 +71,45 @@ impl PairingButtonWatcher {
     }
 
     /// Called from the raw-input thread on every detected press: records the
-    /// press for the test indicator, and also mirrors it into the
-    /// module-level `LAST_PRESS_MILLIS` so `mic_tap.rs` can suppress the
-    /// button's own mechanical click from registering as a shell tap —
-    /// see `recently_pressed`.
+    /// press for the test indicator, mirrors it into the module-level
+    /// `LAST_PRESS_MILLIS` so `mic_tap.rs` can suppress the button's own
+    /// mechanical click from registering as a shell tap (see
+    /// `recently_pressed`), and drives the pie menu — ending an active
+    /// voice-input hold takes priority; otherwise this unconditionally
+    /// simulates a real Enter keypress via `pie_menu::confirm_via_button`,
+    /// by design: this is meant to be a general-purpose "pairing button =
+    /// Enter" remap, not something scoped to the pie menu specifically
+    /// (matching the original design, which calls for the same mapping
+    /// whether the menu is open or not). `confirm_via_button` (not a bare
+    /// `key_inject::press_enter()`) re-focuses the overlay first if it's
+    /// open — it's only ever real-focused at the moment it's shown, and
+    /// anything else grabbing OS focus afterward (routine while someone
+    /// takes a moment to read/decide on a pending question) would otherwise
+    /// silently swallow this press: the Enter would land wherever that
+    /// focus went instead of the overlay's keydown handler, with nothing
+    /// visibly happening. See that function's doc comment for the full
+    /// reasoning — this was a real, reproduced failure mode, not a
+    /// theoretical one.
     fn on_press(&self) {
         let now = now_millis();
         self.last_press_millis.store(now, Ordering::Relaxed);
         LAST_PRESS_MILLIS.store(now, Ordering::Relaxed);
+        HELD.store(true, Ordering::Relaxed);
+        if debug_enabled() {
+            eprintln!("[pairing] press");
+        }
+        if !crate::pie_menu::end_voice_hold_if_active() {
+            crate::pie_menu::confirm_via_button();
+        }
+        // Every press also feeds Windows' own volume handling as a side
+        // effect that can't be suppressed at the input level — see
+        // volume_guard.rs — so undo the level change. Unconditional, unlike
+        // the Enter above: this side effect happens regardless of whether
+        // the menu is open. The OSD window itself is suppressed by a
+        // separate always-on background loop (also in volume_guard.rs)
+        // rather than a call here, since it turned out not to be reliably
+        // tied to just this one press event.
+        crate::volume_guard::restore_after_press();
     }
 
     /// Called on the HID release transition. The physical button has an
@@ -81,6 +121,10 @@ impl PairingButtonWatcher {
     /// covers it.
     fn on_release(&self) {
         LAST_PRESS_MILLIS.store(now_millis(), Ordering::Relaxed);
+        HELD.store(false, Ordering::Relaxed);
+        if debug_enabled() {
+            eprintln!("[pairing] release");
+        }
     }
 }
 
@@ -90,9 +134,22 @@ impl PairingButtonWatcher {
 /// watcher itself.
 static LAST_PRESS_MILLIS: AtomicU64 = AtomicU64::new(0);
 
+/// True for the entire press-to-release span, not just a fixed window from
+/// the press edge — a held-longer-than-usual press (repositioning a finger,
+/// hesitating before letting go) can itself jostle the receiver against the
+/// mic partway through, not only right at the press/release instants that
+/// `recently_pressed`'s edge-triggered window covers.
+static HELD: AtomicBool = AtomicBool::new(false);
+
+/// True while the button is currently held down.
+pub fn is_held() -> bool {
+    HELD.load(Ordering::Relaxed)
+}
+
 /// True if the pairing button was pressed within the last `window` — the
 /// button's own physical click is picked up by the mic and can otherwise
-/// read as a shell tap.
+/// read as a shell tap. Covers the press and release clicks specifically;
+/// combine with `is_held` to also cover the time spent held in between.
 pub fn recently_pressed(window: Duration) -> bool {
     let last = LAST_PRESS_MILLIS.load(Ordering::Relaxed);
     last != 0 && now_millis().saturating_sub(last) < window.as_millis() as u64
@@ -139,7 +196,7 @@ pub fn pairing_button_test_active(watcher: tauri::State<'_, Arc<PairingButtonWat
 
 #[cfg(windows)]
 mod win32 {
-    use super::{PairingButtonWatcher, PID, VID};
+    use super::{debug_enabled, PairingButtonWatcher, PID, VID};
     use std::sync::atomic::{AtomicIsize, Ordering};
     use std::sync::Arc;
     use windows::core::w;
@@ -306,6 +363,21 @@ mod win32 {
             return;
         }
         let report = std::slice::from_raw_parts(hid.bRawData.as_ptr(), report_size);
+        if debug_enabled() {
+            // Temporary root-cause diagnostic for the volume-popup side
+            // effect: dumps the exact bytes Windows' Consumer Control class
+            // driver also sees, so we can tell whether the button is really
+            // asserting a Volume Increment/Decrement usage (fixed at the
+            // device's own firmware/report-descriptor level, not something
+            // fixable in this app) versus something else entirely. dwCount
+            // > 1 would mean multiple reports arrived batched in one
+            // WM_INPUT and this only looks at the first — logged so that
+            // isn't silently missed either.
+            eprintln!(
+                "[pairing] raw report bytes (dwCount={}, dwSizeHid={}): {:02x?}",
+                hid.dwCount, hid.dwSizeHid, report
+            );
+        }
         if report[1] != 0 {
             watcher.on_press();
         } else {

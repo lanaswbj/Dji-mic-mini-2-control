@@ -12,6 +12,17 @@
 //! Run with `cargo run` from this directory. Set `DJIMIC_DEBUG=1` for
 //! verbose logging (near-miss taps, chosen audio device details, all
 //! enumerated input devices while the mic isn't found).
+//!
+//! `cargo run -- collect` records the original six phases (quiet, speech,
+//! loud speech, other environmental noise, nail taps, pad taps).
+//! `cargo run -- collect-extra` appends two more hard-negative phases
+//! (pairing-button press, blowing on the mic), and `cargo run --
+//! collect-friction` appends one more (finger sliding/rubbing against the
+//! mic shell, the kind of incidental contact a real button press involves
+//! beyond just the button's own click) — none of these touch or redo
+//! anything `collect` already recorded. All write to the same
+//! `data/samples.csv` (append-only), then `cargo run -- train` retrains on
+//! the combined file.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -21,6 +32,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use tap_model::features::{self, NoveltyState, VadState, N_BANDS, N_FEATURES};
 
 fn debug_enabled() -> bool {
     std::env::var_os("DJIMIC_DEBUG").is_some()
@@ -74,17 +86,19 @@ fn log_line(line: String) {
 const DEBOUNCE: Duration = Duration::from_millis(100);
 const TAP_WINDOW: Duration = Duration::from_millis(450);
 const RMS_WINDOW_LEN: usize = 20;
-/// Supplementary hard floors on top of the ML classifier, deliberately set
-/// aggressive: quiet/soft incidental sounds (clothing rustle, footsteps, a
-/// tap several feet away, a light brush of the mic) can still have a
-/// tap-shaped spectrum and slip past the model, but they're both quieter
-/// and less sharply transient than someone deliberately, firmly tapping the
-/// mic shell. Trading sensitivity for precision here on purpose — a missed
-/// light tap is much less annoying than a random false trigger while
-/// talking or moving around. Tune down (independently) if genuine firm taps
-/// stop registering.
-const HARD_PEAK_FLOOR: f32 = 600.0;
-const HARD_RATIO_FLOOR: f32 = 10.0;
+/// Supplementary hard floors on top of the ML classifier — a nominal safety
+/// net against literal silence/near-zero readings, not the primary filter.
+/// Used to be set much more aggressively (peak>600, ratio>10) to reject
+/// quiet/soft incidental sounds the model might slip on, but retraining on
+/// *cleaned* labels (see `clean_peak_min` in `run_train`) plus a higher
+/// `confidence_threshold` gave the classifier itself enough of that job that
+/// the old floors were mostly rejecting genuine soft-but-real taps instead —
+/// see PROTOCOL/CLAUDE.md history for the offline held-out sweep that found
+/// this. Tune down further (independently) if genuine firm taps still don't
+/// register; tune back up if false triggers from ambient noise become a
+/// problem in practice.
+const HARD_PEAK_FLOOR: f32 = 150.0;
+const HARD_RATIO_FLOOR: f32 = 1.5;
 /// Crest factor (peak / rms *within this one chunk*, not peak/baseline
 /// across chunks like `HARD_RATIO_FLOOR`) — turned out to be an unreliable
 /// gate in practice: `DJIMIC_DEBUG=1` logs against genuine taps showed
@@ -104,223 +118,49 @@ const HARD_CREST_FLOOR: f32 = 1.2;
 /// Kept short so it doesn't eat into legitimate fast double/triple taps.
 const TAP_CONFIRM_DELAY: Duration = Duration::from_millis(150);
 
-/// This device's audio config sample rate (confirmed via `DJIMIC_DEBUG=1`
-/// logging — `[mic] opening ... rate=48000`), used to place the Goertzel
-/// analysis bins in `spectral_features`. Hardcoded rather than threaded
-/// through every call site since this specific receiver has only ever been
-/// observed at this rate; if `cargo run` ever logs a different rate, update
-/// this to match.
-const SAMPLE_RATE_HZ: f32 = 48000.0;
+/// A candidate only confirms if `ratio` dropped to at most this fraction of
+/// its own peak (recorded when the candidate was raised) at some point
+/// before `TAP_CONFIRM_DELAY` elapses — see `PendingTap::seen_decay`.
+/// Targets continuous noise a single audio-chunk snapshot can otherwise
+/// mistake for a tap (blowing on the mic, rubbing/scrubbing it): both stay
+/// loud for hundreds of milliseconds, while a real mechanical tap's
+/// shell-resonance ring-down dies out fast. Deliberately self-relative to
+/// each candidate's own peak rather than the slow 20-chunk rolling baseline
+/// `HARD_RATIO_FLOOR` compares against — an earlier, baseline-relative
+/// version of this idea ("has it gone quiet since the last tap") was tried
+/// and removed for blocking legitimate rapid double/triple taps, since that
+/// baseline stays elevated through a fast burst. This version doesn't have
+/// that problem: each candidate's decay is judged only against its own
+/// starting peak, so a second real tap re-elevating the signal shortly after
+/// doesn't retroactively undo the first candidate's own already-observed
+/// decay.
+const SUSTAIN_DECAY_FRACTION: f32 = 0.5;
 
-/// Small neural net (1 hidden layer, tanh activation, softmax output over
-/// 3 classes) trained on real recorded data from this receiver via
-/// `cargo run -- collect` + `cargo run -- train`, replacing the hand-tuned
-/// peak/ratio thresholds ported from the macOS reference (guessed for
-/// different hardware, never fired on this mic). A plain binary logistic
-/// regression over amplitude-only features (peak/rms/ratio) was tried
-/// first but confused loud speech for taps — this adds real spectral
-/// features (see `spectral_features`) so the model can use *timbre*, not
-/// just level, to tell a hard mechanical knock from a vocal transient, and
-/// classifies taps into two kinds instead of one lumped "tap" class, since
-/// a fingernail knock and a fingertip-pad tap sound noticeably different
-/// (nail: sharper/higher-frequency click; pad: softer/duller thud). The 8th
-/// feature is spectral-flux onset novelty (see `NoveltyState`) — a
-/// mature, well-established MIR (music information retrieval) technique
-/// for detecting percussive onsets (used in tools like aubio/essentia),
-/// borrowed here instead of hand-rolling yet another ad hoc "how sudden is
-/// this" heuristic like the crest-factor attempt that didn't pan out.
-/// Classes: `0 = not a tap, 1 = fingernail tap, 2 = fingertip-pad tap`.
-/// Feature order: `[ln(peak), ln(rms), ln(ratio), zcr, ln(crest),
-/// centroid/1000, ln(high/low band ratio), ln(novelty)]`. Retrain and paste
-/// in new values here (the `train` command prints ready-to-paste `const`
-/// lines) whenever more data is collected.
-const N_FEATURES: usize = 8;
-const N_HIDDEN: usize = 8;
-const N_CLASSES: usize = 3;
-
-const TAP_W1: [[f32; N_HIDDEN]; N_FEATURES] = [
-    [0.135535, -0.076446, 0.004948, -0.180434, -0.095998, -0.385457, -0.022245, 0.054475],
-    [0.105033, 0.028647, -0.252446, -0.179555, 0.018818, -0.714688, 0.069344, 0.010913],
-    [-0.322777, -0.131798, 0.797818, 0.207440, -0.011429, 0.736934, -0.260370, 0.334038],
-    [-0.193070, -0.233307, -0.248121, -0.247495, -0.139189, -0.420904, 0.065982, -0.067548],
-    [0.322476, 0.073638, 0.093224, -0.209518, -0.147059, 0.053186, -0.253215, 0.105858],
-    [-0.146326, -0.114495, -0.485083, -0.403872, -0.261615, 0.108842, 0.157607, 0.025234],
-    [-0.274176, 0.176817, -0.383225, -0.228265, 0.347999, -0.196006, -0.456033, -0.172476],
-    [0.026121, -0.094991, 0.253257, 0.274173, -0.321361, 0.050310, 0.256826, -0.188330],
-];
-const TAP_B1: [f32; N_HIDDEN] =
-    [0.567922, 0.154472, -0.102371, 0.207297, -0.108343, -0.483559, 1.251333, -0.455840];
-const TAP_W2: [[f32; N_CLASSES]; N_HIDDEN] = [
-    [0.794097, -0.320796, -0.402413],
-    [0.136090, 0.073055, -0.090941],
-    [-0.916578, 0.598011, 0.592258],
-    [0.030284, -0.725793, 0.337637],
-    [-0.354197, 0.270782, -0.209570],
-    [-0.562380, -0.892894, 1.114725],
-    [1.339380, -0.600914, -0.769204],
-    [-0.429989, 0.299540, 0.460390],
-];
-const TAP_B2: [f32; N_CLASSES] = [1.225891, -0.418108, -0.807783];
-const TAP_MEAN: [f32; N_FEATURES] =
-    [5.097567, 4.183465, 0.977682, 0.039682, 0.914110, 0.877099, -2.485912, -6.234169];
-const TAP_STD: [f32; N_FEATURES] =
-    [1.298908, 1.282411, 0.760981, 0.039219, 0.170054, 0.516419, 1.077319, 1.391290];
-/// Raised from the model's natural 0.5 decision boundary — same reasoning
-/// as the hard floors above, demand a confidently unambiguous "yes" rather
-/// than a bare majority.
-const TAP_CONFIDENCE_THRESHOLD: f32 = 0.55;
-
-const TAP_CLASS_NAMES: [&str; N_CLASSES] = ["none", "指甲", "指腹"];
-
-/// Goertzel algorithm: signal magnitude at one target frequency, without
-/// needing a full FFT (or an FFT crate) for just a handful of bins.
-fn goertzel_magnitude(samples: &[i16], target_hz: f32) -> f32 {
-    if samples.len() < 8 {
-        return 0.0;
-    }
-    let n = samples.len() as f32;
-    let k = (0.5 + n * target_hz / SAMPLE_RATE_HZ).floor();
-    let omega = 2.0 * std::f32::consts::PI * k / n;
-    let coeff = 2.0 * omega.cos();
-    let (mut s_prev, mut s_prev2) = (0.0f32, 0.0f32);
-    for &sample in samples {
-        let s = sample as f32 + coeff * s_prev - s_prev2;
-        s_prev2 = s_prev;
-        s_prev = s;
-    }
-    (s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2)
-        .max(0.0)
-        .sqrt()
-}
-
-/// Crude 4-band spectral snapshot (returns `(centroid_hz, high/low energy
-/// ratio)`) — gives the classifier a sense of *timbre* instead of only
-/// amplitude/dynamics: a hard knock on the mic shell is a broadband,
-/// high-frequency-heavy transient, while voiced speech concentrates energy
-/// in low harmonics even when it's loud.
-fn spectral_features(samples: &[i16]) -> (f32, f32) {
-    const BANDS: [f32; 4] = [300.0, 1000.0, 3000.0, 6000.0];
-    let mags: [f32; 4] = std::array::from_fn(|i| goertzel_magnitude(samples, BANDS[i]));
-    let total: f32 = mags.iter().sum::<f32>().max(1e-6);
-    let centroid = BANDS.iter().zip(mags.iter()).map(|(f, m)| f * m).sum::<f32>() / total;
-    let low = mags[0] + mags[1];
-    let high = mags[2] + mags[3];
-    let hl_ratio = high / low.max(1e-6);
-    (centroid, hl_ratio)
-}
-
-/// Spectral-flux based onset novelty (`microdsp::sfnov`) — a mature MIR
-/// (music information retrieval) technique for detecting percussive
-/// onsets, the same family of algorithm behind tools like aubio/essentia's
-/// onset detectors. Measures frame-to-frame *change* in the spectrum, not
-/// just its static shape, so it targets exactly "how sudden is this attack"
-/// — the thing `HARD_CREST_FLOOR` tried and failed to capture reliably.
-/// Wrapped in its own state since the underlying detector needs continuity
-/// across chunks (it compares each frame's spectrum to the previous one).
-struct NoveltyState {
-    detector: microdsp::sfnov::SpectralFluxNoveltyDetector<microdsp::sfnov::HardKneeCompression>,
-    last_novelty: f32,
-}
-
-/// Onset detector's internal analysis window. Smaller = lower latency but
-/// less frequency resolution; 512 samples at 48kHz is ~10.7ms, kept small
-/// on purpose since low latency was an explicit goal.
-const NOVELTY_WINDOW_SIZE: usize = 512;
-
-impl Default for NoveltyState {
-    fn default() -> Self {
-        NoveltyState {
-            detector: microdsp::sfnov::SpectralFluxNoveltyDetector::new(NOVELTY_WINDOW_SIZE),
-            last_novelty: 0.0,
-        }
-    }
-}
-
-impl NoveltyState {
-    fn update(&mut self, samples: &[i16]) -> f32 {
-        let float_samples: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
-        let mut latest = self.last_novelty;
-        self.detector.process(&float_samples, |flux| {
-            latest = flux.novelty();
-        });
-        self.last_novelty = latest;
-        latest
-    }
-}
-
-/// Turns raw per-chunk measurements into the model's input vector. Shared
-/// by inference (fed live values) and training (fed values parsed back out
-/// of the collected CSV), so the two can never drift apart.
-fn build_feature_vector(
-    peak: f32,
-    rms: f32,
-    ratio: f32,
-    zcr: f32,
-    centroid: f32,
-    hl_ratio: f32,
-    novelty: f32,
-) -> [f32; N_FEATURES] {
-    let crest = (peak / rms.max(1.0)).max(1.0);
-    [
-        peak.max(1.0).ln(),
-        rms.max(1.0).ln(),
-        ratio.max(1.0).ln(),
-        zcr,
-        crest.ln(),
-        centroid / 1000.0,
-        hl_ratio.max(1e-3).ln(),
-        novelty.max(1e-4).ln(),
-    ]
-}
-
-/// Runs the hidden layer only — shared by inference and training so the
-/// forward pass can't drift between the two.
-fn tap_hidden_layer(
-    x: &[f32; N_FEATURES],
-    w1: &[[f32; N_HIDDEN]; N_FEATURES],
-    b1: &[f32; N_HIDDEN],
-) -> [f32; N_HIDDEN] {
-    std::array::from_fn(|j| {
-        let mut sum = b1[j];
-        for i in 0..N_FEATURES {
-            sum += x[i] * w1[i][j];
-        }
-        sum.tanh()
-    })
-}
-
-fn softmax(logits: [f32; N_CLASSES]) -> [f32; N_CLASSES] {
-    let max = logits.iter().cloned().fold(f32::MIN, f32::max);
-    let exps: [f32; N_CLASSES] = std::array::from_fn(|k| (logits[k] - max).exp());
-    let sum: f32 = exps.iter().sum::<f32>().max(1e-9);
-    std::array::from_fn(|k| exps[k] / sum)
-}
-
-/// Class probabilities `[none, nail, pad]` for one audio chunk, per the
-/// trained model.
-fn tap_class_probabilities(features: [f32; N_FEATURES]) -> [f32; N_CLASSES] {
-    let x: [f32; N_FEATURES] =
-        std::array::from_fn(|i| (features[i] - TAP_MEAN[i]) / TAP_STD[i]);
-    let hidden = tap_hidden_layer(&x, &TAP_W1, &TAP_B1);
-    let logits: [f32; N_CLASSES] = std::array::from_fn(|k| {
-        let mut z = TAP_B2[k];
-        for j in 0..N_HIDDEN {
-            z += hidden[j] * TAP_W2[j][k];
-        }
-        z
-    });
-    softmax(logits)
-}
-
-/// The most likely class and its probability, per [`tap_class_probabilities`].
-fn tap_predict(features: [f32; N_FEATURES]) -> (usize, f32) {
-    let probs = tap_class_probabilities(features);
-    let (idx, &p) = probs
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-        .unwrap();
-    (idx, p)
+/// Small neural net (1 hidden layer, tanh activation, optionally with a
+/// small 1D-conv path over the spectral-band sequence, softmax output),
+/// trained on real recorded data from this receiver via `cargo run --
+/// collect` + `cargo run -- train`, replacing the hand-tuned peak/ratio
+/// thresholds ported from the macOS reference (guessed for different
+/// hardware, never fired on this mic). A plain binary logistic regression
+/// over amplitude-only features (peak/rms/ratio) was tried first but
+/// confused loud speech for taps — this adds real spectral features (see
+/// `tap_model::features::spectral_bands`) so the model can use *timbre*,
+/// not just level, to tell a hard mechanical knock from a vocal transient.
+///
+/// The weights, forward pass, training, *and* the feature-extraction/VAD
+/// math itself all now live in the shared `tap-model` crate
+/// (`../../crates/tap-model`) instead of being duplicated here and in
+/// `gui/src-tauri/src/mic_tap.rs` — see that crate's doc comment and
+/// `tap_model::features`'. `run_train` fits a new `tap_model::TapModel` and
+/// writes it to `%APPDATA%\org.djimic.control\tap_model.json`, which the
+/// real app picks up via its hot-swap poll with no rebuild needed. Only
+/// classes `0 = not a tap` / `1 = tap` are modeled — nail/pad sub-classes
+/// were dropped (see `tap_model::features`' doc comment for the offline
+/// evidence: recall ~45%→~99.7% through the exact same runtime inference
+/// gate) since nothing downstream ever branched on which anyway.
+fn tap_predict(model: &tap_model::TapModel, features: [f32; N_FEATURES]) -> (usize, f32) {
+    let result = model.predict(&features);
+    (result.class, result.confidence)
 }
 
 /// Matches the Windows audio input device name against the receiver. Its
@@ -331,131 +171,12 @@ fn is_dji_mic_name(name: &str) -> bool {
     lower.contains("mic rx") || lower.contains("wireless mic") || lower.contains("dji")
 }
 
-// ---------------------------------------------------------------------
-// Speech gating: the tap classifier alone still occasionally reads a sharp
-// consonant or loud exclamation as a tap, since its features are single
-// small-frame amplitude/spectral snapshots, not a real model of speech.
-// Running a dedicated (and much better-trained) voice-activity detector
-// alongside it and suppressing tap classification while it reports speech
-// closes that gap without needing to chase it via more tap-model tuning.
-// ---------------------------------------------------------------------
-
-/// Silero VAD (the neural-net model, not the classical WebRTC-style
-/// `earshot` this replaced) operates on 16kHz mono, 512-sample (32ms)
-/// frames; our device captures at 48kHz, so every 3rd raw sample is kept.
-/// The `voice_activity_detector` crate's `ort` backend downloads its own
-/// ONNX Runtime binary as part of `cargo build` (no manual DLL placement
-/// needed, unlike `silero-vad-rust`, which was tried first and dropped —
-/// it has a broken internal `ndarray` version conflict as published).
-const VAD_DOWNSAMPLE_RATIO: usize = 3;
-const VAD_FRAME_LEN: usize = 512;
-/// One-pole low-pass cutoff (~7kHz) applied before dropping samples down to
-/// 16kHz, so the 48kHz->16kHz decimation doesn't alias high-frequency
-/// speech content (sibilants especially) into noise the VAD can't read.
-/// alpha = 1 - exp(-2*pi*fc/fs) for fc=7000Hz, fs=48000Hz.
-const VAD_LOWPASS_ALPHA: f32 = 0.6;
-/// Silero's own scores are much better-calibrated than earshot's, but this
-/// still leans below its usual ~0.5 default: false-negatives here (real
-/// speech scored as non-speech) let the tap classifier's own speech/tap
-/// confusion through, which matters more in practice than occasionally
-/// gating out a real tap.
-const VAD_SCORE_THRESHOLD: f32 = 0.35;
-/// How long tap detection stays suppressed after the last speech frame —
-/// covers the brief pauses within a sentence so the gate doesn't flicker
-/// open between words.
-const VAD_HOLDOVER: Duration = Duration::from_millis(450);
-
-struct VadState {
-    detector: voice_activity_detector::VoiceActivityDetector,
-    lp_state: f32,
-    sample_counter: u64,
-    frame_buf: Vec<i16>,
-    speech_until: Option<Instant>,
-    /// Most recent frame's score, purely for `DJIMIC_DEBUG=1` diagnostics.
-    last_score: f32,
-    /// When `DJIMIC_DEBUG=1`, every 16kHz sample actually fed to the VAD
-    /// gets written here too — lets a human listen to exactly what the
-    /// model sees, to check whether the 48kHz->16kHz downsampling itself
-    /// is producing clean audio or garbage before suspecting the model.
-    debug_wav: Option<hound::WavWriter<std::io::BufWriter<std::fs::File>>>,
-}
-
-impl Default for VadState {
-    fn default() -> Self {
-        let detector = voice_activity_detector::VoiceActivityDetector::builder()
-            .sample_rate(16_000)
-            .chunk_size(VAD_FRAME_LEN)
-            .build()
-            .expect("failed to build Silero VAD detector");
-        let debug_wav = debug_enabled().then(|| {
-            let spec = hound::WavSpec {
-                channels: 1,
-                sample_rate: 16_000,
-                bits_per_sample: 16,
-                sample_format: hound::SampleFormat::Int,
-            };
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vad_debug.wav");
-            let writer = hound::WavWriter::create(&path, spec)
-                .expect("failed to create vad_debug.wav");
-            println!("[vad] dumping what the VAD hears to {}", path.display());
-            writer
-        });
-        VadState {
-            detector,
-            lp_state: 0.0,
-            sample_counter: 0,
-            frame_buf: Vec::new(),
-            speech_until: None,
-            last_score: 0.0,
-            debug_wav,
-        }
-    }
-}
-
-impl VadState {
-    fn update(&mut self, samples: &[i16], now: Instant) {
-        for &s in samples {
-            self.lp_state += VAD_LOWPASS_ALPHA * (s as f32 - self.lp_state);
-            self.sample_counter += 1;
-            if self.sample_counter % VAD_DOWNSAMPLE_RATIO as u64 == 0 {
-                let down = self.lp_state.clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-                self.frame_buf.push(down);
-                if let Some(w) = &mut self.debug_wav {
-                    let _ = w.write_sample(down);
-                }
-            }
-        }
-
-        while self.frame_buf.len() >= VAD_FRAME_LEN {
-            let frame: Vec<i16> = self.frame_buf[..VAD_FRAME_LEN].to_vec();
-            self.last_score = self.detector.predict(frame);
-            if self.last_score > VAD_SCORE_THRESHOLD {
-                self.speech_until = Some(now + VAD_HOLDOVER);
-            }
-            self.frame_buf.drain(0..VAD_FRAME_LEN);
-        }
-
-        // Ctrl+C kills the process without running destructors, so anything
-        // still sitting in the WavWriter's internal BufWriter never reaches
-        // disk unless it's flushed along the way — without this the debug
-        // WAV comes out completely empty regardless of what audio was
-        // actually captured.
-        if let Some(w) = &mut self.debug_wav {
-            let _ = w.flush();
-        }
-    }
-
-    fn is_speech(&self, now: Instant) -> bool {
-        self.speech_until.is_some_and(|t| now < t)
-    }
-}
-
 #[derive(Default)]
 struct DetectionState {
     rms_window: VecDeque<f32>,
     tap_count: u32,
-    /// Class index (per `TAP_CLASS_NAMES`) of each tap in the current burst,
-    /// so the group-finalize line can show what kind each one was.
+    /// Class index (per the live model's `class_names`) of each tap in the
+    /// current burst, so the group-finalize line can show what kind each one was.
     tap_classes: Vec<usize>,
     last_tap: Option<Instant>,
     debounce_until: Option<Instant>,
@@ -468,11 +189,28 @@ struct DetectionState {
     /// silently dropped while the first is still pending. Oldest-first;
     /// confirmed/cancelled together but timed independently.
     pending_taps: Vec<PendingTap>,
+    /// Previous chunk's `ratio`/`ln(novelty)` — see
+    /// `tap_model::features::build_feature_vector`'s delta features.
+    prev_ratio: Option<f32>,
+    prev_ln_novelty: Option<f32>,
 }
 
 struct PendingTap {
     detected_at: Instant,
     class: usize,
+    /// `ratio` at the moment this candidate was raised — the yardstick
+    /// `seen_decay` compares later chunks against.
+    peak_ratio: f32,
+    /// Set once `ratio` has dropped to `SUSTAIN_DECAY_FRACTION` of
+    /// `peak_ratio` at some point since this candidate started. A real
+    /// mechanical tap's ring-down dies out within a few chunks even during a
+    /// fast multi-tap burst (the next tap's own impact re-elevates the
+    /// signal, but only after this has already flipped true); continuous
+    /// noise like blowing on the mic or rubbing/scrubbing it stays elevated
+    /// the whole confirm window and never flips it. See the confirm loop in
+    /// `process_chunk`, which rejects candidates that reach confirm time
+    /// still `false`.
+    seen_decay: bool,
 }
 
 fn rms(samples: &[i16]) -> f32 {
@@ -505,7 +243,7 @@ fn median(values: &VecDeque<f32>) -> f32 {
     }
 }
 
-fn process_chunk(state: &mut DetectionState, samples: &[i16]) {
+fn process_chunk(model: &tap_model::TapModel, state: &mut DetectionState, samples: &[i16]) {
     let now = Instant::now();
     state.vad.update(samples, now);
     let speech = state.vad.is_speech(now);
@@ -520,10 +258,28 @@ fn process_chunk(state: &mut DetectionState, samples: &[i16]) {
     }
     let baseline = median(&state.rms_window).max(1.0);
     let ratio = p / baseline;
-    let (centroid, hl_ratio) = spectral_features(samples);
+    let bands = features::spectral_bands(samples);
     let novelty = state.novelty.update(samples);
-    let (class, confidence) =
-        tap_predict(build_feature_vector(p, r, ratio, zcr, centroid, hl_ratio, novelty));
+    let (attack_pos, energy_skew) = features::attack_shape(samples);
+    let ln_novelty = novelty.max(1e-4).ln();
+    let delta_ratio = ratio.max(1.0).ln() - state.prev_ratio.unwrap_or(ratio).max(1.0).ln();
+    let delta_novelty = ln_novelty - state.prev_ln_novelty.unwrap_or(ln_novelty);
+    state.prev_ratio = Some(ratio);
+    state.prev_ln_novelty = Some(ln_novelty);
+
+    let feature_vector =
+        features::build_feature_vector(p, r, ratio, zcr, novelty, &bands, attack_pos, energy_skew, delta_ratio, delta_novelty);
+    let (class, confidence) = tap_predict(model, feature_vector);
+    let class_name = |c: usize| model.class_names.get(c).map(String::as_str).unwrap_or("?");
+
+    // Every pending candidate watches every subsequent chunk for its own
+    // decay, regardless of what else is happening this chunk — see
+    // `PendingTap::seen_decay`.
+    for pending in &mut state.pending_taps {
+        if !pending.seen_decay && ratio < pending.peak_ratio * SUSTAIN_DECAY_FRACTION {
+            pending.seen_decay = true;
+        }
+    }
 
     // The moment VAD catches up and flags speech, cancel every candidate
     // still waiting to be confirmed — those were speech onset, not real
@@ -534,7 +290,7 @@ fn process_chunk(state: &mut DetectionState, samples: &[i16]) {
             for pending in &state.pending_taps {
                 log_line(format!(
                     "[tap] cancelled pending {} — VAD caught up (score={:.2})",
-                    TAP_CLASS_NAMES[pending.class], state.vad.last_score
+                    class_name(pending.class), state.vad.last_score
                 ));
             }
         }
@@ -558,7 +314,7 @@ fn process_chunk(state: &mut DetectionState, samples: &[i16]) {
     // slot rather than being dropped because "one's already pending".
     if warmed_up
         && class != 0
-        && confidence > TAP_CONFIDENCE_THRESHOLD
+        && confidence > model.confidence_threshold
         && !debounced
         && !speech
         && loud_enough
@@ -566,22 +322,27 @@ fn process_chunk(state: &mut DetectionState, samples: &[i16]) {
         if debug_enabled() {
             log_line(format!(
                 "[tap] candidate {} conf={confidence:.2} peak={p:.0} ratio={ratio:.1} novelty={novelty:.3} — waiting {TAP_CONFIRM_DELAY:?} to confirm",
-                TAP_CLASS_NAMES[class]
+                class_name(class)
             ));
         }
-        state.pending_taps.push(PendingTap { detected_at: now, class });
+        state.pending_taps.push(PendingTap {
+            detected_at: now,
+            class,
+            peak_ratio: ratio,
+            seen_decay: false,
+        });
         state.debounce_until = Some(now + DEBOUNCE);
     } else if debug_enabled()
         && warmed_up
         && class != 0
-        && confidence > TAP_CONFIDENCE_THRESHOLD
+        && confidence > model.confidence_threshold
         && !debounced
         && !speech
         && !loud_enough
     {
         log_line(format!(
             "[tap] too quiet/soft, ignored: class={} conf={confidence:.2} peak={p:.0} (need >{HARD_PEAK_FLOOR}) ratio={ratio:.1} (need >{HARD_RATIO_FLOOR}) crest={crest:.1} (need >{HARD_CREST_FLOOR}) novelty={novelty:.3}",
-            TAP_CLASS_NAMES[class]
+            class_name(class)
         ));
     }
 
@@ -589,9 +350,19 @@ fn process_chunk(state: &mut DetectionState, samples: &[i16]) {
     // oldest first — usually at most one per call, but a burst of rapid
     // taps can confirm several in the same chunk.
     while state.pending_taps.first().is_some_and(|p| now.duration_since(p.detected_at) >= TAP_CONFIRM_DELAY) {
-        let class = state.pending_taps.remove(0).class;
+        let pending = state.pending_taps.remove(0);
+        if !pending.seen_decay {
+            if debug_enabled() {
+                log_line(format!(
+                    "[tap] rejected {} — never decayed, looks like sustained noise (blow/rub) not a tap",
+                    class_name(pending.class)
+                ));
+            }
+            continue;
+        }
+        let class = pending.class;
         if debug_enabled() {
-            log_line(format!("[tap] confirmed {}", TAP_CLASS_NAMES[class]));
+            log_line(format!("[tap] confirmed {}", class_name(class)));
         }
         let within_window = state.last_tap.is_some_and(|t| now.duration_since(t) <= TAP_WINDOW);
         if within_window {
@@ -601,7 +372,7 @@ fn process_chunk(state: &mut DetectionState, samples: &[i16]) {
                 log_line(format!(
                     ">>> [TAP] {} tap(s) detected ({})",
                     state.tap_count,
-                    state.tap_classes.iter().map(|&c| TAP_CLASS_NAMES[c]).collect::<Vec<_>>().join(", ")
+                    state.tap_classes.iter().map(|&c| class_name(c)).collect::<Vec<_>>().join(", ")
                 ));
                 state.tap_classes.clear();
             }
@@ -616,7 +387,7 @@ fn process_chunk(state: &mut DetectionState, samples: &[i16]) {
             log_line(format!(
                 ">>> [TAP] {} tap(s) detected ({})",
                 state.tap_count,
-                state.tap_classes.iter().map(|&c| TAP_CLASS_NAMES[c]).collect::<Vec<_>>().join(", ")
+                state.tap_classes.iter().map(|&c| class_name(c)).collect::<Vec<_>>().join(", ")
             ));
             state.tap_count = 0;
             state.tap_classes.clear();
@@ -642,7 +413,7 @@ fn find_device() -> Option<cpal::Device> {
         .find(|d| d.name().map(|n| is_dji_mic_name(&n)).unwrap_or(false))
 }
 
-fn try_open_and_run() -> Result<(), String> {
+fn try_open_and_run(model: &Arc<tap_model::TapModel>) -> Result<(), String> {
     let device = find_device().ok_or("device not found")?;
 
     let config = device.default_input_config().map_err(|e| e.to_string())?;
@@ -661,11 +432,12 @@ fn try_open_and_run() -> Result<(), String> {
     let stream = match sample_format {
         cpal::SampleFormat::I16 => {
             let state = state.clone();
+            let model = model.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _| {
                     let mono: Vec<i16> = data.chunks(channels.max(1)).map(|f| f[0]).collect();
-                    process_chunk(&mut state.lock().unwrap(), &mono);
+                    process_chunk(&model, &mut state.lock().unwrap(), &mono);
                 },
                 err_fn,
                 None,
@@ -673,6 +445,7 @@ fn try_open_and_run() -> Result<(), String> {
         }
         cpal::SampleFormat::F32 => {
             let state = state.clone();
+            let model = model.clone();
             device.build_input_stream(
                 &stream_config,
                 move |data: &[f32], _| {
@@ -680,7 +453,7 @@ fn try_open_and_run() -> Result<(), String> {
                         .chunks(channels.max(1))
                         .map(|f| (f[0].clamp(-1.0, 1.0) * 32767.0) as i16)
                         .collect();
-                    process_chunk(&mut state.lock().unwrap(), &mono);
+                    process_chunk(&model, &mut state.lock().unwrap(), &mono);
                 },
                 err_fn,
                 None,
@@ -702,9 +475,19 @@ fn try_open_and_run() -> Result<(), String> {
 }
 
 fn run_mic_tap() {
+    // Loaded once at startup — this standalone test tool doesn't need the
+    // real app's hot-swap poll (see gui/src-tauri/src/mic_tap.rs), just a
+    // model consistent with whatever's on disk (or the embedded baseline).
+    let path = tap_model::model_file_path().unwrap_or_default();
+    let model = Arc::new(tap_model::TapModel::load_or_default(&path));
+    println!(
+        "[mic] loaded model: source={:?} trained_at={} rows={} confidence_threshold={:.2}",
+        model.source, model.trained_at_unix_ms, model.training_rows, model.confidence_threshold
+    );
+
     let mut logged_devices = false;
     loop {
-        if let Err(e) = try_open_and_run() {
+        if let Err(e) = try_open_and_run(&model) {
             if !logged_devices {
                 println!("[mic] {e}");
                 log_all_input_devices();
@@ -737,9 +520,48 @@ static CURRENT_LABEL: AtomicU8 = AtomicU8::new(0);
 static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// The tap class (1=指甲, 2=指腹) the current capture window is recording.
 static CAPTURE_LABEL: AtomicU8 = AtomicU8::new(0);
-/// Buffered `(peak, rms, ratio, zcr, centroid, hl_ratio, novelty)` rows for
-/// the current capture window, relabeled and flushed by `finish_capture`.
-static CAPTURE_BUFFER: Mutex<Vec<(f32, f32, f32, f32, f32, f32, f32)>> = Mutex::new(Vec::new());
+/// Buffered rows for the current capture window, relabeled and flushed by
+/// `finish_capture`.
+static CAPTURE_BUFFER: Mutex<Vec<RawRow>> = Mutex::new(Vec::new());
+
+/// One chunk's raw (not-yet-labeled) measurements — everything
+/// `tap_model::features::build_feature_vector` needs, plus `peak` on its
+/// own for the neighbor-labeling/cleaning floors. `centroid`/`hl_ratio`/
+/// `rolloff`/`flatness` aren't stored separately since they're all derived
+/// from `bands` at feature-vector-build time.
+#[derive(Clone, Copy)]
+struct RawRow {
+    peak: f32,
+    rms: f32,
+    ratio: f32,
+    zcr: f32,
+    novelty: f32,
+    bands: [f32; N_BANDS],
+    attack_pos: f32,
+    energy_skew: f32,
+    delta_ratio: f32,
+    delta_novelty: f32,
+}
+
+impl RawRow {
+    fn write_csv(&self, w: &mut impl Write, label: u8) {
+        let bands: Vec<String> = self.bands.iter().map(|b| format!("{b:.1}")).collect();
+        let _ = writeln!(
+            w,
+            "{label},{:.1},{:.1},{:.2},{:.4},{:.4},{},{:.3},{:.3},{:.3},{:.3}",
+            self.peak,
+            self.rms,
+            self.ratio,
+            self.zcr,
+            self.novelty,
+            bands.join(","),
+            self.attack_pos,
+            self.energy_skew,
+            self.delta_ratio,
+            self.delta_novelty
+        );
+    }
+}
 
 fn zero_crossing_rate(samples: &[i16]) -> f32 {
     if samples.len() < 2 {
@@ -756,39 +578,63 @@ fn data_dir() -> std::path::PathBuf {
 /// The CSV header this build writes/expects. Bumping the feature set (like
 /// adding the spectral columns) changes this — `run_collect` checks it
 /// against any existing file and starts a fresh one rather than silently
-/// mixing schemas if it doesn't match.
-const CSV_HEADER: &str = "label,peak,rms,ratio,zcr,centroid,hl_ratio,novelty";
+/// mixing schemas if it doesn't match. Raw (not derived) measurements only
+/// — matches `gui/src-tauri/src/tap_feedback.rs`'s feedback CSV schema
+/// exactly, so files from either source can be folded together at
+/// training time.
+const CSV_HEADER: &str = "label,peak,rms,ratio,zcr,novelty,band0,band1,band2,band3,band4,band5,band6,band7,band8,band9,band10,band11,attack_pos,energy_skew,delta_ratio,delta_novelty";
+const CSV_COLUMNS: usize = 22;
+
+/// Per-stream state `write_feature_row` needs across calls — bundled into
+/// one struct (rather than separate `Arc<Mutex<_>>`s per field, as an
+/// earlier version had for just `rms_window`/`novelty_state`) now that the
+/// delta features need their own carried-forward state too.
+#[derive(Default)]
+struct CollectState {
+    rms_window: VecDeque<f32>,
+    novelty: NoveltyState,
+    prev_ratio: Option<f32>,
+    prev_ln_novelty: Option<f32>,
+}
 
 fn write_feature_row(
     writer: &Arc<Mutex<std::io::BufWriter<std::fs::File>>>,
-    rms_window: &Arc<Mutex<VecDeque<f32>>>,
-    novelty_state: &Arc<Mutex<NoveltyState>>,
+    state: &Arc<Mutex<CollectState>>,
     samples: &[i16],
 ) {
     let r = rms(samples);
     let p = peak(samples);
     let zcr = zero_crossing_rate(samples);
-    let (centroid, hl_ratio) = spectral_features(samples);
-    let novelty = novelty_state.lock().unwrap().update(samples);
+    let bands = features::spectral_bands(samples);
+    let (attack_pos, energy_skew) = features::attack_shape(samples);
 
-    let baseline = {
-        let mut window = rms_window.lock().unwrap();
-        window.push_back(r);
-        if window.len() > RMS_WINDOW_LEN {
-            window.pop_front();
+    let (ratio, novelty, delta_ratio, delta_novelty) = {
+        let mut st = state.lock().unwrap();
+        let novelty = st.novelty.update(samples);
+        st.rms_window.push_back(r);
+        if st.rms_window.len() > RMS_WINDOW_LEN {
+            st.rms_window.pop_front();
         }
-        median(&window).max(1.0)
+        let baseline = median(&st.rms_window).max(1.0);
+        let ratio = p / baseline;
+        let ln_novelty = novelty.max(1e-4).ln();
+        let delta_ratio = ratio.max(1.0).ln() - st.prev_ratio.unwrap_or(ratio).max(1.0).ln();
+        let delta_novelty = ln_novelty - st.prev_ln_novelty.unwrap_or(ln_novelty);
+        st.prev_ratio = Some(ratio);
+        st.prev_ln_novelty = Some(ln_novelty);
+        (ratio, novelty, delta_ratio, delta_novelty)
     };
-    let ratio = p / baseline;
+
+    let row = RawRow { peak: p, rms: r, ratio, zcr, novelty, bands, attack_pos, energy_skew, delta_ratio, delta_novelty };
 
     if CAPTURE_ACTIVE.load(Ordering::Relaxed) {
-        CAPTURE_BUFFER.lock().unwrap().push((p, r, ratio, zcr, centroid, hl_ratio, novelty));
+        CAPTURE_BUFFER.lock().unwrap().push(row);
         return;
     }
 
     let label = CURRENT_LABEL.load(Ordering::Relaxed);
     let mut w = writer.lock().unwrap();
-    let _ = writeln!(w, "{label},{p:.1},{r:.1},{ratio:.2},{zcr:.4},{centroid:.1},{hl_ratio:.3},{novelty:.4}");
+    row.write_csv(&mut *w, label);
     let _ = w.flush();
 }
 
@@ -802,29 +648,62 @@ fn start_capture(class: u8) {
     CAPTURE_ACTIVE.store(true, Ordering::Relaxed);
 }
 
+/// A capture-window neighbor of the loudest chunk only inherits the tap
+/// label if it's still this loud — otherwise it's almost always the quiet
+/// tail of the ring-down or a reaction-time gap, not the impact itself. An
+/// offline analysis of the full recorded dataset found a substantial chunk
+/// of "tap"-labeled rows sitting at near-zero peak amplitude (25th
+/// percentile ~96, versus a median tap peak of ~1741) purely because of this
+/// unconditional neighbor-labeling — training on those mislabeled-as-tap
+/// silent frames was a real contributor to the classifier's poor recall.
+/// Matches the `clean_peak_min` cleaning threshold `run_train` also applies
+/// (belt-and-suspenders: this prevents new mislabels at collection time,
+/// that one cleans up rows collected before this fix existed).
+const CAPTURE_NEIGHBOR_MIN_PEAK: f32 = 1200.0;
+
 /// Stops buffering and flushes the window to the CSV. Only the loudest
-/// chunk (plus its immediate neighbors, to cover the short decay) gets the
-/// target tap label; everything else in the window is background. Labeling
-/// the *entire* window as the tap class — what this replaced — mislabels
-/// most of it, since the actual click only lasts a couple of chunks and its
-/// position inside the window isn't fixed.
+/// chunk gets the target tap label unconditionally; its immediate neighbors
+/// (to cover the short decay) get it too, but only if they're still loud
+/// enough to plausibly be part of the same impact rather than its quiet
+/// tail — see `CAPTURE_NEIGHBOR_MIN_PEAK`. Labeling the *entire* window as
+/// the tap class — what this replaced — mislabels most of it, since the
+/// actual click only lasts a couple of chunks and its position inside the
+/// window isn't fixed.
 fn finish_capture(writer: &Arc<Mutex<std::io::BufWriter<std::fs::File>>>) {
     CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
     let class = CAPTURE_LABEL.load(Ordering::Relaxed);
     let buffer = std::mem::take(&mut *CAPTURE_BUFFER.lock().unwrap());
     let Some((peak_idx, _)) =
-        buffer.iter().enumerate().max_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap())
+        buffer.iter().enumerate().max_by(|a, b| a.1.peak.partial_cmp(&b.1.peak).unwrap())
     else {
         return;
     };
 
     let mut w = writer.lock().unwrap();
-    for (i, (p, r, ratio, zcr, centroid, hl_ratio, novelty)) in buffer.iter().enumerate() {
-        let label = if i.abs_diff(peak_idx) <= 1 { class } else { 0 };
-        let _ = writeln!(
-            w,
-            "{label},{p:.1},{r:.1},{ratio:.2},{zcr:.4},{centroid:.1},{hl_ratio:.3},{novelty:.4}"
-        );
+    for (i, row) in buffer.iter().enumerate() {
+        let label = if i == peak_idx {
+            class
+        } else if i.abs_diff(peak_idx) <= 1 && row.peak >= CAPTURE_NEIGHBOR_MIN_PEAK {
+            class
+        } else {
+            0
+        };
+        row.write_csv(&mut *w, label);
+    }
+    let _ = w.flush();
+}
+
+/// Like `finish_capture`, but labels *every* row in the window as background
+/// (0), including its loudest moment — for hard-negative phases (pairing
+/// button click, blowing on the mic) where the whole point is that the loud
+/// part isn't a tap and the model needs to see it labeled that way, not just
+/// the quiet edges around it.
+fn finish_capture_as_background(writer: &Arc<Mutex<std::io::BufWriter<std::fs::File>>>) {
+    CAPTURE_ACTIVE.store(false, Ordering::Relaxed);
+    let buffer = std::mem::take(&mut *CAPTURE_BUFFER.lock().unwrap());
+    let mut w = writer.lock().unwrap();
+    for row in buffer.iter() {
+        row.write_csv(&mut *w, 0);
     }
     let _ = w.flush();
 }
@@ -880,20 +759,18 @@ fn run_collect() {
         writeln!(writer.lock().unwrap(), "{CSV_HEADER}").unwrap();
     }
 
-    let rms_window: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let novelty_state: Arc<Mutex<NoveltyState>> = Arc::new(Mutex::new(NoveltyState::default()));
+    let collect_state: Arc<Mutex<CollectState>> = Arc::new(Mutex::new(CollectState::default()));
     let err_fn = |e: cpal::StreamError| println!("[collect] stream error: {e}");
 
     let stream = {
         let writer = writer.clone();
-        let rms_window = rms_window.clone();
-        let novelty_state = novelty_state.clone();
+        let collect_state = collect_state.clone();
         match sample_format {
             cpal::SampleFormat::I16 => device.build_input_stream(
                 &stream_config,
                 move |data: &[i16], _| {
                     let mono: Vec<i16> = data.chunks(channels.max(1)).map(|f| f[0]).collect();
-                    write_feature_row(&writer, &rms_window, &novelty_state, &mono);
+                    write_feature_row(&writer, &collect_state, &mono);
                 },
                 err_fn,
                 None,
@@ -905,7 +782,7 @@ fn run_collect() {
                         .chunks(channels.max(1))
                         .map(|f| (f[0].clamp(-1.0, 1.0) * 32767.0) as i16)
                         .collect();
-                    write_feature_row(&writer, &rms_window, &novelty_state, &mono);
+                    write_feature_row(&writer, &collect_state, &mono);
                 },
                 err_fn,
                 None,
@@ -991,32 +868,295 @@ fn run_collect() {
     println!("[collect] 可以多跑几次 `cargo run -- collect` 累积更多数据（会追加，不会覆盖）。");
 }
 
-// ---------------------------------------------------------------------
-// Offline training (`cargo run -- train`): hand-rolled batch-gradient-
-// descent over the CSV `collect` produces, for the 1-hidden-layer/
-// softmax-output net defined above. Deliberately not pulling in an ML
-// crate (linfa etc.) — 7 features, 3 classes, and a few thousand rows
-// train fine with plain Rust, and it keeps this tool dependency-light
-// like the rest of the project.
-// ---------------------------------------------------------------------
+/// Two extra hard-negative phases (pairing-button press, blowing on the
+/// mic), kept as a separate command from `run_collect` on purpose: both are
+/// deliberately labeled 0 (background) in their entirety via
+/// `finish_capture_as_background` rather than picking out a peak like a real
+/// tap phase would, and running this doesn't require redoing (or risk
+/// duplicating a lot of) the original six phases — it only appends these two
+/// new ones to the same `samples.csv`, leaving everything already collected
+/// untouched.
+fn run_collect_extra() {
+    let Some(device) = find_device() else {
+        println!("[collect-extra] 没找到麦克风设备，请先确认普通模式下（cargo run，不带参数）能看到 [mic] opening ...");
+        return;
+    };
 
-/// Tiny deterministic PRNG (xorshift64) for weight init — avoids pulling in
-/// the `rand` crate for what's just a handful of small random numbers.
-struct Rng(u64);
-impl Rng {
-    fn next_unit(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        (self.0 as f64 / u64::MAX as f64) as f32 * 2.0 - 1.0
+    let config = device.default_input_config().expect("default_input_config failed");
+    let sample_format = config.sample_format();
+    let channels = config.channels() as usize;
+    println!(
+        "[collect-extra] opening {:?} format={sample_format:?} channels={channels} rate={}",
+        device.name(),
+        config.sample_rate().0
+    );
+    let stream_config: cpal::StreamConfig = config.into();
+
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let csv_path = dir.join("samples.csv");
+
+    if let Ok(existing) = std::fs::read_to_string(&csv_path) {
+        if existing.lines().next().is_some_and(|h| h != CSV_HEADER) {
+            println!(
+                "[collect-extra] {} 的表头和当前特征列不匹配，先运行一次 `cargo run -- collect` 让它按新格式重建，再来跑这个。",
+                csv_path.display()
+            );
+            return;
+        }
     }
+
+    let is_new = !csv_path.exists();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&csv_path)
+        .expect("open csv for append");
+    let writer = Arc::new(Mutex::new(std::io::BufWriter::new(file)));
+    if is_new {
+        writeln!(writer.lock().unwrap(), "{CSV_HEADER}").unwrap();
+    }
+
+    let collect_state: Arc<Mutex<CollectState>> = Arc::new(Mutex::new(CollectState::default()));
+    let err_fn = |e: cpal::StreamError| println!("[collect-extra] stream error: {e}");
+
+    let stream = {
+        let writer = writer.clone();
+        let collect_state = collect_state.clone();
+        match sample_format {
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _| {
+                    let mono: Vec<i16> = data.chunks(channels.max(1)).map(|f| f[0]).collect();
+                    write_feature_row(&writer, &collect_state, &mono);
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _| {
+                    let mono: Vec<i16> = data
+                        .chunks(channels.max(1))
+                        .map(|f| (f[0].clamp(-1.0, 1.0) * 32767.0) as i16)
+                        .collect();
+                    write_feature_row(&writer, &collect_state, &mono);
+                },
+                err_fn,
+                None,
+            ),
+            _ => {
+                println!("[collect-extra] unsupported sample format");
+                return;
+            }
+        }
+    }
+    .expect("build_input_stream failed");
+    stream.play().expect("stream.play failed");
+
+    let stdin = std::io::stdin();
+    let wait_for_enter = |prompt: &str| {
+        print!("{prompt}");
+        std::io::stdout().flush().ok();
+        let mut l = String::new();
+        stdin.read_line(&mut l).ok();
+    };
+    let prepare = |seconds: u64| {
+        println!("准备中，{seconds} 秒后开始...");
+        for remaining in (1..=seconds).rev() {
+            print!("{remaining}...");
+            std::io::stdout().flush().ok();
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        println!("开始！");
+    };
+
+    println!("\n=== 附加阶段 A：接收器配对键按下（硬负样本）===");
+    println!("请按一下接收器上的配对键（短按后松开即可）。每次按回车后立刻按一下，共 30 次。");
+    println!("这些全部记为“不是敲击”，让模型学会分辨按键的咔哒声和敲击麦克风外壳的区别。");
+    prepare(10);
+    for i in 1..=30 {
+        wait_for_enter(&format!("按键 第 {i}/30 次，按回车后按下配对键: "));
+        start_capture(0);
+        std::thread::sleep(Duration::from_millis(700));
+        finish_capture_as_background(&writer);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    println!("\n=== 附加阶段 B：对着麦克风吹气（硬负样本）===");
+    println!("请对着麦克风轻轻吹一口气（力度可以有变化）。每次按回车后立刻吹一下，共 30 次。");
+    prepare(10);
+    for i in 1..=30 {
+        wait_for_enter(&format!("吹气 第 {i}/30 次，按回车后吹气: "));
+        start_capture(0);
+        std::thread::sleep(Duration::from_millis(700));
+        finish_capture_as_background(&writer);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    drop(stream);
+    println!("\n[collect-extra] 采集完成，数据已追加写入 {}", csv_path.display());
+    println!("[collect-extra] 原有数据没有变动，可以直接运行 `cargo run -- train` 重新训练。");
 }
 
-fn fmt_array(values: &[f32]) -> String {
-    values.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(", ")
+/// A third hard-negative phase, kept separate from `run_collect_extra` (its
+/// own subcommand) so it doesn't force re-running the button-press/blow-air
+/// phases just to add this one:手指划过/摩擦麦克风外壳的声音, specifically
+/// because a real pairing-button press isn't just the button's own click —
+/// reaching a finger over to it naturally brushes against the mic shell too,
+/// and that friction sound is inconsistent enough in timing relative to the
+/// HID press event (sometimes right before it, sometimes overlapping) that
+/// suppressing purely off the press/release timestamps in
+/// `pairing_button.rs` can't reliably catch it. Teaching the classifier to
+/// recognize the sound itself, rather than only gating off button state,
+/// covers it regardless of timing.
+fn run_collect_friction() {
+    let Some(device) = find_device() else {
+        println!("[collect-friction] 没找到麦克风设备，请先确认普通模式下（cargo run，不带参数）能看到 [mic] opening ...");
+        return;
+    };
+
+    let config = device.default_input_config().expect("default_input_config failed");
+    let sample_format = config.sample_format();
+    let channels = config.channels() as usize;
+    println!(
+        "[collect-friction] opening {:?} format={sample_format:?} channels={channels} rate={}",
+        device.name(),
+        config.sample_rate().0
+    );
+    let stream_config: cpal::StreamConfig = config.into();
+
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir).expect("create data dir");
+    let csv_path = dir.join("samples.csv");
+
+    if let Ok(existing) = std::fs::read_to_string(&csv_path) {
+        if existing.lines().next().is_some_and(|h| h != CSV_HEADER) {
+            println!(
+                "[collect-friction] {} 的表头和当前特征列不匹配，先运行一次 `cargo run -- collect` 让它按新格式重建，再来跑这个。",
+                csv_path.display()
+            );
+            return;
+        }
+    }
+
+    let is_new = !csv_path.exists();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&csv_path)
+        .expect("open csv for append");
+    let writer = Arc::new(Mutex::new(std::io::BufWriter::new(file)));
+    if is_new {
+        writeln!(writer.lock().unwrap(), "{CSV_HEADER}").unwrap();
+    }
+
+    let collect_state: Arc<Mutex<CollectState>> = Arc::new(Mutex::new(CollectState::default()));
+    let err_fn = |e: cpal::StreamError| println!("[collect-friction] stream error: {e}");
+
+    let stream = {
+        let writer = writer.clone();
+        let collect_state = collect_state.clone();
+        match sample_format {
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _| {
+                    let mono: Vec<i16> = data.chunks(channels.max(1)).map(|f| f[0]).collect();
+                    write_feature_row(&writer, &collect_state, &mono);
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _| {
+                    let mono: Vec<i16> = data
+                        .chunks(channels.max(1))
+                        .map(|f| (f[0].clamp(-1.0, 1.0) * 32767.0) as i16)
+                        .collect();
+                    write_feature_row(&writer, &collect_state, &mono);
+                },
+                err_fn,
+                None,
+            ),
+            _ => {
+                println!("[collect-friction] unsupported sample format");
+                return;
+            }
+        }
+    }
+    .expect("build_input_stream failed");
+    stream.play().expect("stream.play failed");
+
+    let stdin = std::io::stdin();
+    let wait_for_enter = |prompt: &str| {
+        print!("{prompt}");
+        std::io::stdout().flush().ok();
+        let mut l = String::new();
+        stdin.read_line(&mut l).ok();
+    };
+    let prepare = |seconds: u64| {
+        println!("准备中，{seconds} 秒后开始...");
+        for remaining in (1..=seconds).rev() {
+            print!("{remaining}...");
+            std::io::stdout().flush().ok();
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        println!("开始！");
+    };
+
+    println!("\n=== 附加阶段 C：手指划过/摩擦麦克风外壳（硬负样本）===");
+    println!("模拟你去按配对键时手指划过外壳的感觉：手指从外面移过来，轻轻蹭一下麦克风外壳，");
+    println!("不用真的按到配对键。力度、角度、快慢都可以变化着来。每次按回车后立刻做一次，共 30 次。");
+    prepare(10);
+    for i in 1..=30 {
+        wait_for_enter(&format!("摩擦 第 {i}/30 次，按回车后蹭一下外壳: "));
+        start_capture(0);
+        std::thread::sleep(Duration::from_millis(800));
+        finish_capture_as_background(&writer);
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    drop(stream);
+    println!("\n[collect-friction] 采集完成，数据已追加写入 {}", csv_path.display());
+    println!("[collect-friction] 原有数据没有变动，可以直接运行 `cargo run -- train` 重新训练。");
 }
 
-fn run_train() {
+// ---------------------------------------------------------------------
+// Offline training (`cargo run -- train`): builds a `tap_model::TapModel`
+// from the CSV `collect` produces. The forward pass, the batch-gradient-
+// descent loop, and the model format all live in the shared `tap-model`
+// crate now (see its doc comment) — this function's job is just the
+// data-prep steps specific to *this* dataset: label cleaning, the
+// nail/pad -> binary tap-vs-none collapse, and augmenting the still-rare
+// positive class.
+// ---------------------------------------------------------------------
+
+/// A recorded tap row whose peak amplitude is below this is almost always a
+/// mislabeled neighbor frame from the old (pre-`CAPTURE_NEIGHBOR_MIN_PEAK`)
+/// collection code, not a genuine impact — relabeling it back to "none"
+/// before training is what an offline held-out sweep over the full 128k-row
+/// dataset found gave the single biggest recall improvement (far more than
+/// any feature or architecture change), since a real fingernail/fingertip
+/// tap on this hardware is essentially never this quiet. Matches
+/// `CAPTURE_NEIGHBOR_MIN_PEAK` in spirit but tuned independently (empirical
+/// sweep landed noticeably higher, at 1200, than what collection-time
+/// filtering alone needs).
+const TRAIN_CLEAN_PEAK_MIN: f32 = 1200.0;
+/// Each surviving tap row is repeated this many times with small Gaussian
+/// jitter (see `augment_row`) — the positive class is still only ~0.5% of
+/// all rows even after cleaning, and this gave a measurable recall gain in
+/// the same offline sweep without needing more real hardware recordings.
+const TRAIN_AUGMENT_FACTOR: usize = 15;
+/// Jitter magnitude as a fraction of the *tap class's own* per-feature
+/// std-dev (not the whole dataset's, which is dominated by "none").
+const TRAIN_AUGMENT_SIGMA: f32 = 0.25;
+
+fn augment_row(rng: &mut tap_model::Rng, feat: &[f32; N_FEATURES], tap_std: &[f32; N_FEATURES]) -> [f32; N_FEATURES] {
+    std::array::from_fn(|i| feat[i] + rng.next_gaussian() * TRAIN_AUGMENT_SIGMA * tap_std[i])
+}
+
+fn run_train(bake_default: bool) {
     let csv_path = data_dir().join("samples.csv");
     let content = match std::fs::read_to_string(&csv_path) {
         Ok(c) => c,
@@ -1027,216 +1167,160 @@ fn run_train() {
         }
     };
 
-    let mut rows: Vec<([f32; N_FEATURES], usize)> = Vec::new();
+    // raw_label is 0/none, 1/nail, or 2/pad exactly as recorded — kept
+    // around only to decide which rows are "quiet enough to relabel" below;
+    // the model itself is trained on a plain binary tap-vs-none target,
+    // since nail-vs-pad was never anything but a training-data trick (see
+    // the doc comment above `tap_predict`) and merging them recalls far more
+    // real taps.
+    let mut raw: Vec<(f32, [f32; N_FEATURES])> = Vec::new();
     for line in content.lines().skip(1) {
         let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() != 8 {
+        if parts.len() != CSV_COLUMNS {
             continue;
         }
-        let (Ok(label), Ok(p), Ok(r), Ok(ratio), Ok(zcr), Ok(centroid), Ok(hl_ratio), Ok(novelty)) = (
-            parts[0].parse::<f32>(),
-            parts[1].parse::<f32>(),
-            parts[2].parse::<f32>(),
-            parts[3].parse::<f32>(),
-            parts[4].parse::<f32>(),
-            parts[5].parse::<f32>(),
-            parts[6].parse::<f32>(),
-            parts[7].parse::<f32>(),
-        ) else {
+        let Ok(values): Result<Vec<f32>, _> = parts.iter().map(|p| p.parse::<f32>()).collect() else {
             continue;
         };
-        let class = (label.round() as usize).min(N_CLASSES - 1);
-        rows.push((build_feature_vector(p, r, ratio, zcr, centroid, hl_ratio, novelty), class));
+        let label = values[0];
+        let (p, r, ratio, zcr, novelty) = (values[1], values[2], values[3], values[4], values[5]);
+        let bands: [f32; N_BANDS] = std::array::from_fn(|i| values[6 + i]);
+        let attack_pos = values[6 + N_BANDS];
+        let energy_skew = values[7 + N_BANDS];
+        let delta_ratio = values[8 + N_BANDS];
+        let delta_novelty = values[9 + N_BANDS];
+        raw.push((
+            label,
+            features::build_feature_vector(p, r, ratio, zcr, novelty, &bands, attack_pos, energy_skew, delta_ratio, delta_novelty),
+        ));
     }
 
-    if rows.is_empty() {
+    if raw.is_empty() {
         println!("[train] {} 里没有可用数据", csv_path.display());
         return;
     }
-    let mut counts = [0usize; N_CLASSES];
-    for (_, c) in &rows {
-        counts[*c] += 1;
+
+    // peak (feature index 0 is ln(peak)) — recover it to apply the cleaning
+    // floor in the same units `collect` recorded it in.
+    let peak_of = |feat: &[f32; N_FEATURES]| feat[0].exp();
+
+    let mut relabeled = 0usize;
+    let mut rows: Vec<(Vec<f32>, usize)> = Vec::new();
+    let mut tap_feats_for_std: Vec<[f32; N_FEATURES]> = Vec::new();
+    for (label, feat) in &raw {
+        let is_tap_raw = *label != 0.0;
+        let clean_tap = is_tap_raw && peak_of(feat) >= TRAIN_CLEAN_PEAK_MIN;
+        if is_tap_raw && !clean_tap {
+            relabeled += 1;
+        }
+        let class = if clean_tap { 1usize } else { 0usize };
+        if class == 1 {
+            tap_feats_for_std.push(*feat);
+        }
+        rows.push((feat.to_vec(), class));
     }
+
+    let mut none_count = rows.iter().filter(|(_, c)| *c == 0).count();
+    let tap_count = rows.len() - none_count;
     println!(
-        "[train] loaded {} rows (none={}, 指甲={}, 指腹={})",
-        rows.len(),
-        counts[0],
-        counts[1],
-        counts[2]
+        "[train] loaded {} rows (none={none_count}, tap={tap_count}, relabeled {relabeled} quiet tap rows back to none)",
+        rows.len()
     );
-
-    let n = rows.len() as f32;
-    let mut mean = [0.0f32; N_FEATURES];
-    for (f, _) in &rows {
-        for i in 0..N_FEATURES {
-            mean[i] += f[i];
-        }
-    }
-    for m in &mut mean {
-        *m /= n;
-    }
-    let mut std_dev = [0.0f32; N_FEATURES];
-    for (f, _) in &rows {
-        for i in 0..N_FEATURES {
-            std_dev[i] += (f[i] - mean[i]).powi(2);
-        }
-    }
-    for s in &mut std_dev {
-        *s = (*s / n).sqrt().max(1e-6);
+    if tap_count == 0 {
+        println!("[train] 没有可用的 tap 样本，先采集数据。");
+        return;
     }
 
-    let normalized: Vec<([f32; N_FEATURES], usize)> = rows
-        .iter()
-        .map(|(f, c)| (std::array::from_fn(|i| (f[i] - mean[i]) / std_dev[i]), *c))
-        .collect();
-
-    let mut rng = Rng(0x9E3779B97F4A7C15);
-    let mut w1 = [[0.0f32; N_HIDDEN]; N_FEATURES];
-    for row in &mut w1 {
-        for w in row.iter_mut() {
-            *w = rng.next_unit() * 0.3;
-        }
-    }
-    let mut b1 = [0.0f32; N_HIDDEN];
-    let mut w2 = [[0.0f32; N_CLASSES]; N_HIDDEN];
-    for row in &mut w2 {
-        for w in row.iter_mut() {
-            *w = rng.next_unit() * 0.3;
-        }
-    }
-    let mut b2 = [0.0f32; N_CLASSES];
-
-    const LR: f32 = 0.1;
-    const EPOCHS: u32 = 4000;
-    const EPS: f32 = 1e-7;
-
-    // "none" outnumbers each tap class roughly 17:1 in a typical recording
-    // session (a few taps vs. many seconds of quiet/speech/noise), so plain
-    // unweighted cross-entropy converges to mostly predicting "none" and
-    // barely ever fires on real taps. Full inverse-frequency weighting
-    // (total / (classes * count)) overcorrects badly at this ratio — tried
-    // it, and "none" recall dropped to ~73% (27% false-positive rate on
-    // ordinary speech/silence). Using its square root instead compresses
-    // the weight range (~17x becomes ~4x) for a milder correction: enough
-    // for the rare tap classes to matter during training without drowning
-    // out the plentiful, easy "none" examples.
-    let class_weight: [f32; N_CLASSES] = std::array::from_fn(|k| {
-        if counts[k] > 0 {
-            (n / (N_CLASSES as f32 * counts[k] as f32)).sqrt()
-        } else {
-            0.0
-        }
+    // Per-feature std of the (cleaned) tap rows only — used to scale
+    // augmentation jitter to the positive class's own spread rather than
+    // the whole dataset's (which is dominated by "none").
+    let tap_mean: [f32; N_FEATURES] = std::array::from_fn(|i| {
+        tap_feats_for_std.iter().map(|f| f[i]).sum::<f32>() / tap_feats_for_std.len() as f32
     });
-    println!("[train] class weights (imbalance correction): {class_weight:?}");
+    let tap_std: [f32; N_FEATURES] = std::array::from_fn(|i| {
+        (tap_feats_for_std.iter().map(|f| (f[i] - tap_mean[i]).powi(2)).sum::<f32>()
+            / tap_feats_for_std.len() as f32)
+            .sqrt()
+            .max(1e-3)
+    });
 
-    for epoch in 0..EPOCHS {
-        let mut grad_w1 = [[0.0f32; N_HIDDEN]; N_FEATURES];
-        let mut grad_b1 = [0.0f32; N_HIDDEN];
-        let mut grad_w2 = [[0.0f32; N_CLASSES]; N_HIDDEN];
-        let mut grad_b2 = [0.0f32; N_CLASSES];
-        let mut loss = 0.0f32;
-
-        for (x, class) in &normalized {
-            let hidden = tap_hidden_layer(x, &w1, &b1);
-            let logits: [f32; N_CLASSES] = std::array::from_fn(|k| {
-                let mut z = b2[k];
-                for j in 0..N_HIDDEN {
-                    z += hidden[j] * w2[j][k];
-                }
-                z
-            });
-            let probs = softmax(logits);
-            let weight = class_weight[*class];
-            loss -= weight * (probs[*class] + EPS).ln();
-
-            // Softmax + cross-entropy gradient wrt logits is simply
-            // (predicted - one_hot(true_class)) per class, scaled by this
-            // sample's class weight to match the weighted loss above.
-            let dz: [f32; N_CLASSES] = std::array::from_fn(|k| {
-                weight * (probs[k] - if k == *class { 1.0 } else { 0.0 })
-            });
-            for j in 0..N_HIDDEN {
-                for k in 0..N_CLASSES {
-                    grad_w2[j][k] += dz[k] * hidden[j];
-                }
-            }
-            for k in 0..N_CLASSES {
-                grad_b2[k] += dz[k];
-            }
-            for j in 0..N_HIDDEN {
-                let dh: f32 = (0..N_CLASSES).map(|k| dz[k] * w2[j][k]).sum();
-                let dh_raw = dh * (1.0 - hidden[j] * hidden[j]);
-                grad_b1[j] += dh_raw;
-                for i in 0..N_FEATURES {
-                    grad_w1[i][j] += dh_raw * x[i];
-                }
-            }
+    let mut rng = tap_model::Rng::new(0x9E3779B97F4A7C15);
+    let mut augmented = 0usize;
+    for (feat, class) in rows.clone() {
+        if class == 0 {
+            continue;
         }
-
-        for i in 0..N_FEATURES {
-            for j in 0..N_HIDDEN {
-                w1[i][j] -= LR * grad_w1[i][j] / n;
-            }
-        }
-        for j in 0..N_HIDDEN {
-            b1[j] -= LR * grad_b1[j] / n;
-            for k in 0..N_CLASSES {
-                w2[j][k] -= LR * grad_w2[j][k] / n;
-            }
-        }
-        for k in 0..N_CLASSES {
-            b2[k] -= LR * grad_b2[k] / n;
-        }
-
-        if epoch % 500 == 0 || epoch == EPOCHS - 1 {
-            println!("[train] epoch {epoch} loss={:.4}", loss / n);
+        let feat_arr: [f32; N_FEATURES] = std::array::from_fn(|i| feat[i]);
+        for _ in 0..TRAIN_AUGMENT_FACTOR {
+            rows.push((augment_row(&mut rng, &feat_arr, &tap_std).to_vec(), 1));
+            augmented += 1;
         }
     }
-
-    // Sanity-check accuracy on the training set itself (not a held-out
-    // split — good enough as a smoke test at this scale, not a rigorous
-    // evaluation). Reports a confusion matrix so it's obvious which classes
-    // get mixed up, not just an overall percentage.
-    let mut confusion = [[0usize; N_CLASSES]; N_CLASSES]; // [actual][predicted]
-    for (x, class) in &normalized {
-        let hidden = tap_hidden_layer(x, &w1, &b1);
-        let logits: [f32; N_CLASSES] = std::array::from_fn(|k| {
-            let mut z = b2[k];
-            for j in 0..N_HIDDEN {
-                z += hidden[j] * w2[j][k];
-            }
-            z
-        });
-        let probs = softmax(logits);
-        let predicted = probs.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
-        confusion[*class][predicted] += 1;
-    }
-    let correct: usize = (0..N_CLASSES).map(|k| confusion[k][k]).sum();
+    none_count = rows.iter().filter(|(_, c)| *c == 0).count();
     println!(
-        "\n[train] 训练集准确率 {:.1}%（共 {} 条）",
-        100.0 * correct as f32 / normalized.len() as f32,
-        normalized.len()
+        "[train] augmented tap rows x{TRAIN_AUGMENT_FACTOR} (+{augmented}) -> {} total rows (none={none_count}, tap={})",
+        rows.len(),
+        rows.len() - none_count
     );
-    println!("[train] 混淆矩阵（行=真实, 列=预测, 顺序 none/指甲/指腹）：");
-    for row in &confusion {
+
+    // Hidden width and confidence threshold (0.65) came out of the held-out
+    // sweep documented in this project's history — a stricter bar than the
+    // model's natural 0.5 boundary is affordable now that the binary
+    // target's decision boundary is much cleaner. `n_bands`/`conv_channels`/
+    // `conv_kernel` enable `TapModel`'s small 1D-conv path over the 12-band
+    // spectral profile (see that struct's doc comment) instead of feeding
+    // the whole 26-dim vector through one plain dense layer — hidden width
+    // scaled up accordingly (conv pools to 6 channels + 14 scalars = 20
+    // dense inputs, vs. the original 8-feature/8-hidden dense-only model).
+    let cfg = tap_model::TrainConfig {
+        n_hidden: 24,
+        n_classes: 2,
+        epochs: 3000,
+        lr: 0.1,
+        l2: 1e-4,
+        class_names: vec!["none".to_string(), "tap".to_string()],
+        confidence_threshold: 0.65,
+        seed: 0x9E3779B97F4A7C15,
+        n_bands: N_BANDS,
+        conv_channels: 6,
+        conv_kernel: 5,
+    };
+    let (model, report) = tap_model::train(&rows, N_FEATURES, &cfg);
+
+    println!("[train] class counts (post-clean, post-augment): {:?}", report.class_counts);
+    println!(
+        "\n[train] 训练集准确率 {:.1}%（共 {} 条，含增强样本）",
+        100.0 * report.train_accuracy,
+        report.rows
+    );
+    println!("[train] 混淆矩阵（行=真实, 列=预测, 顺序 none/tap）：");
+    for row in &report.confusion {
         println!("  {row:?}");
     }
 
-    println!("\n[train] 训练完成，把下面这些常量整体贴进 main.rs 替换掉旧的 TAP_* 常量：\n");
-    print!("const TAP_W1: [[f32; {N_HIDDEN}]; {N_FEATURES}] = [");
-    for row in &w1 {
-        print!("[{}], ", fmt_array(row));
+    let live_path = match tap_model::model_file_path() {
+        Some(p) => p,
+        None => {
+            println!("[train] 无法解析 %APPDATA%，跳过写入模型文件");
+            return;
+        }
+    };
+    match model.save_to_file(&live_path) {
+        Ok(()) => println!("\n[train] 已写入 {}（正在运行的 app 会自动热加载）", live_path.display()),
+        Err(e) => println!("\n[train] 写入 {} 失败: {e}", live_path.display()),
     }
-    println!("];");
-    println!("const TAP_B1: [f32; {N_HIDDEN}] = [{}];", fmt_array(&b1));
-    print!("const TAP_W2: [[f32; {N_CLASSES}]; {N_HIDDEN}] = [");
-    for row in &w2 {
-        print!("[{}], ", fmt_array(row));
+
+    if bake_default {
+        let baseline_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/tap-model/default_model.json");
+        match model.save_to_file(&baseline_path) {
+            Ok(()) => println!(
+                "[train] --bake-default: 已更新 {}（下次编译会把它当作新装安装的默认模型）",
+                baseline_path.display()
+            ),
+            Err(e) => println!("[train] --bake-default: 写入 {} 失败: {e}", baseline_path.display()),
+        }
     }
-    println!("];");
-    println!("const TAP_B2: [f32; {N_CLASSES}] = [{}];", fmt_array(&b2));
-    println!("const TAP_MEAN: [f32; {N_FEATURES}] = [{}];", fmt_array(&mean));
-    println!("const TAP_STD: [f32; {N_FEATURES}] = [{}];", fmt_array(&std_dev));
 }
 
 // ---------------------------------------------------------------------
@@ -1426,8 +1510,17 @@ fn main() {
             run_collect();
             return;
         }
+        Some("collect-extra") => {
+            run_collect_extra();
+            return;
+        }
+        Some("collect-friction") => {
+            run_collect_friction();
+            return;
+        }
         Some("train") => {
-            run_train();
+            let bake_default = args.iter().any(|a| a == "--bake-default");
+            run_train(bake_default);
             return;
         }
         _ => {}
@@ -1437,7 +1530,7 @@ fn main() {
 
     println!("DJI Mic detect-test — Ctrl+C to exit");
     println!("Set DJIMIC_DEBUG=1 for verbose logs (near-miss taps, raw HID reports, device list)");
-    println!("Other modes: `cargo run -- collect` to record labeled tap data, `cargo run -- train` to fit a classifier\n");
+    println!("Other modes: `cargo run -- collect` to record labeled tap data, `cargo run -- collect-extra` for extra hard-negative phases (button press, blowing on the mic), `cargo run -- collect-friction` for finger-vs-shell friction, `cargo run -- train` to fit a classifier (add `--bake-default` to also refresh crates/tap-model/default_model.json's checked-in baseline)\n");
 
     std::thread::spawn(run_mic_tap);
 

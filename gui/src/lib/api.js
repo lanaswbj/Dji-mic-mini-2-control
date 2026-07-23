@@ -50,3 +50,57 @@ export function pairingButtonTestActive() {
 export function micTapTestStatus() {
   return invoke("mic_tap_test_status");
 }
+
+/**
+ * Report that the most recently detected tap group was wrong (nothing was
+ * actually tapped) — relabels the acoustic event and queues an incremental
+ * retrain. Rejects with a Chinese error message if there's no recent group
+ * to target (see `TapStatus.active`/`.count`).
+ */
+export function micTapReportFalsePositive() {
+  return invoke("mic_tap_report_false_positive");
+}
+
+/**
+ * Report that a real tap on the mic shell went undetected — scans the last
+ * few seconds for the loudest sound and, if it clears a basic sanity floor,
+ * labels it as a tap and queues an incremental retrain.
+ */
+export function micTapReportFalseNegative() {
+  return invoke("mic_tap_report_false_negative");
+}
+
+/** Poll target for the incremental-training panel. */
+export function micTapTrainingStatus() {
+  return invoke("mic_tap_training_status");
+}
+
+/** Restore the model that was live before the last accepted incremental update. */
+export function micTapRollbackModel() {
+  return invoke("mic_tap_rollback_model");
+}
+
+/** Discard all on-device adaptation and go back to the model this build shipped with. */
+export function micTapRestoreFactoryModel() {
+  return invoke("mic_tap_restore_factory_model");
+}
+
+/** Hide the pie menu overlay without picking a slot. */
+export function pieMenuClose() {
+  return invoke("pie_menu_close");
+}
+
+/** Confirm a pie menu slot (0-based). Placeholder slots for now. */
+export function pieMenuSelect(index) {
+  return invoke("pie_menu_select", { index });
+}
+
+/**
+ * Answer a pending Claude Code question relayed from gui/src-tauri/src/hook_bridge.rs
+ * — either a PermissionRequest choice or a single-select AskUserQuestion
+ * tool call — with the chosen slot (0-based, same left-to-right order the
+ * icons/labels were shown in).
+ */
+export function pieMenuAnswerQuestion(index) {
+  return invoke("pie_menu_answer_question", { index });
+}

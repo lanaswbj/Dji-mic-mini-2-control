@@ -1,0 +1,19 @@
+[package]
+name = "tap-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Trained mic-shell-tap classifier: model format, forward pass, training, and a hot-swappable runtime store. Shared by gui/src-tauri (inference) and test-tools/detect-test (training) so the weights and forward-pass math have exactly one home."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+arc-swap = "1"
+# Spectral-flux onset novelty (mature MIR/percussive-onset technique).
+microdsp = "0.1.3"
+# Pure-Rust neural-net VAD, replacing `voice_activity_detector` (which pulled
+# in `ort` + a build-time-downloaded ONNX Runtime purely for this speech
+# gate). See VadState's doc comment for the version-history caveat (the
+# *old* 0.1.x `earshot` was a different, WebRTC-style algorithm that this
+# project already rejected once — 1.x is a from-scratch neural-net rewrite).
+earshot = "1.2"

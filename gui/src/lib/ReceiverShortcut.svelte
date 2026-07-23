@@ -1,8 +1,106 @@
 <script>
+  import {
+    micTapReportFalsePositive,
+    micTapReportFalseNegative,
+    micTapTrainingStatus,
+    micTapRollbackModel,
+    micTapRestoreFactoryModel,
+  } from "./api.js";
+
   let {
     pairingTestActive = false,
     tapStatus = { count: 0, active: false, deviceFound: false },
   } = $props();
+
+  let fbBusy = $state(false);
+  let fbMessage = $state("");
+  let fbError = $state(false);
+  let trainStatus = $state({
+    state: "idle",
+    modelSource: "",
+    modelTrainedAtUnixMs: 0,
+    modelTrainingRows: 0,
+    modelConfidenceThreshold: 0,
+    feedbackRowCount: 0,
+    canRollback: false,
+    lastMessage: "",
+  });
+
+  const SOURCE_LABEL = {
+    Embedded: "出厂模型",
+    FullRetrain: "本地全量训练",
+    Incremental: "增量训练更新",
+  };
+
+  async function pollTrainStatus() {
+    try {
+      trainStatus = await micTapTrainingStatus();
+    } catch {
+      // ignore — non-Windows, or watcher not ready yet
+    }
+  }
+
+  async function reportFalsePositive() {
+    fbBusy = true;
+    fbError = false;
+    try {
+      await micTapReportFalsePositive();
+      fbMessage = "已记录这次误判，模型会在后台用它继续学习。";
+    } catch (e) {
+      fbError = true;
+      fbMessage = String(e);
+    } finally {
+      fbBusy = false;
+      pollTrainStatus();
+    }
+  }
+
+  async function reportFalseNegative() {
+    fbBusy = true;
+    fbError = false;
+    try {
+      await micTapReportFalseNegative();
+      fbMessage = "已记录这次漏判，模型会在后台用它继续学习。";
+    } catch (e) {
+      fbError = true;
+      fbMessage = String(e);
+    } finally {
+      fbBusy = false;
+      pollTrainStatus();
+    }
+  }
+
+  async function rollback() {
+    fbError = false;
+    try {
+      await micTapRollbackModel();
+      fbMessage = "已回滚到上一个模型。";
+    } catch (e) {
+      fbError = true;
+      fbMessage = String(e);
+    } finally {
+      pollTrainStatus();
+    }
+  }
+
+  async function restoreFactory() {
+    fbError = false;
+    try {
+      await micTapRestoreFactoryModel();
+      fbMessage = "已恢复出厂模型，之前的增量学习效果已被清除。";
+    } catch (e) {
+      fbError = true;
+      fbMessage = String(e);
+    } finally {
+      pollTrainStatus();
+    }
+  }
+
+  $effect(() => {
+    pollTrainStatus();
+    const timer = setInterval(pollTrainStatus, 2000);
+    return () => clearInterval(timer);
+  });
 </script>
 
 <div class="shortcut-panel">
@@ -38,14 +136,53 @@
       <div class="empty">未找到麦克风音频输入设备，请确认接收器已连接。</div>
     {/if}
     <div class="tap-row">
-      {#each [1, 2, 3] as n}
+      {#each [1, 2] as n}
         <div class="tap-cell">
           <span class="test-dot" class:on={tapStatus.active && tapStatus.count === n} aria-hidden="true"></span>
           <span>{n} 下</span>
         </div>
       {/each}
     </div>
-    <p class="hint">轻敲麦克风外壳 1/2/3 下试试，对应的指示灯会亮起。</p>
+    <p class="hint">轻敲麦克风外壳 1/2 下试试，对应的指示灯会亮起（3 下及以上会算作 2 下）。</p>
+  </section>
+
+  <section class="shortcut-control" aria-label="识别反馈与增量训练">
+    <div class="shortcut-head">
+      <span class="section-label">识别反馈 · 增量训练</span>
+    </div>
+    <p class="hint">识别错了就点一下——应用会用你的反馈在本地自动继续训练模型，无需重启、无需重装。</p>
+    <div class="feedback-row">
+      <button
+        class="fb-btn"
+        disabled={!tapStatus.active || fbBusy}
+        onclick={reportFalsePositive}
+        title={!tapStatus.active ? "只能撤销最近几百毫秒内刚发生的一次识别" : ""}
+      >
+        刚才不是敲击（误判，撤销）
+      </button>
+      <button class="fb-btn" disabled={fbBusy} onclick={reportFalseNegative}>
+        刚才敲了却没反应（漏判，补报）
+      </button>
+    </div>
+    {#if fbMessage}
+      <div class="fb-message" class:err={fbError}>{fbMessage}</div>
+    {/if}
+
+    <div class="train-status">
+      <span>当前模型：{SOURCE_LABEL[trainStatus.modelSource] ?? "未知"}</span>
+      <span>已积累反馈：{trainStatus.feedbackRowCount} 条</span>
+      <span>状态：{trainStatus.state === "training" ? "正在增量训练…" : "空闲"}</span>
+    </div>
+    {#if trainStatus.lastMessage}
+      <p class="hint">{trainStatus.lastMessage}</p>
+    {/if}
+
+    <div class="feedback-row">
+      <button class="fb-btn ghost" disabled={!trainStatus.canRollback} onclick={rollback}>
+        回滚到上一个模型
+      </button>
+      <button class="fb-btn ghost" onclick={restoreFactory}>恢复出厂模型</button>
+    </div>
   </section>
 </div>
 
@@ -118,7 +255,7 @@
   }
   .tap-row {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     gap: 10px;
   }
   .tap-cell {
@@ -135,6 +272,50 @@
   }
   .hint {
     margin: 0;
+    color: var(--text-dim);
+    font-size: 11px;
+  }
+  .feedback-row {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+  }
+  .fb-btn {
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 10px 12px;
+    background: var(--bg-panel);
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+    text-align: center;
+  }
+  .fb-btn:hover:not(:disabled) {
+    background: var(--bg-elev);
+    border-color: var(--border-strong);
+  }
+  .fb-btn:disabled {
+    color: var(--text-dim);
+    opacity: 0.55;
+  }
+  .fb-btn.ghost {
+    font-weight: 500;
+    color: var(--text-dim);
+  }
+  .fb-message {
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--good) 12%, var(--bg-panel));
+    color: var(--text);
+    font-size: 12px;
+  }
+  .fb-message.err {
+    background: color-mix(in srgb, var(--danger) 14%, var(--bg-panel));
+  }
+  .train-status {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
     color: var(--text-dim);
     font-size: 11px;
   }
