@@ -229,13 +229,17 @@ const VAD_DOWNSAMPLE_RATIO: usize = 3;
 const VAD_FRAME_LEN: usize = 256;
 /// alpha = 1 - exp(-2*pi*fc/fs) for fc=7000Hz, fs=48000Hz.
 const VAD_LOWPASS_ALPHA: f32 = 0.6;
-/// earshot's own docs describe scores over 0.5 as "generally voice"; kept
-/// at that natural boundary rather than Silero's project-specific 0.35
-/// (chosen there to lean toward over-detecting speech) since earshot is a
-/// different score distribution — retune from real-hardware testing if
-/// speech still slips through as taps, or if legitimate taps start getting
-/// speech-gated.
-const VAD_SCORE_THRESHOLD: f32 = 0.5;
+/// earshot's own docs describe scores over 0.5 as "generally voice", which
+/// is where this started out. Real-hardware `DJIMIC_DEBUG=1` testing then
+/// showed a sharp mechanical tap's own broadband transient routinely pushes
+/// earshot's score to 0.51-0.72 for a single frame — well above 0.5 but far
+/// below what genuine sustained speech scores — which was cancelling ~40%
+/// of otherwise-confident (conf 0.90-1.00) tap detections as false "VAD
+/// caught up" speech-onset events. Raised to 0.8 so only clearly-confident
+/// speech gates tap detection; retune further from real-hardware testing if
+/// speech still slips through as taps, or if legitimate taps are still
+/// getting speech-gated.
+const VAD_SCORE_THRESHOLD: f32 = 0.8;
 /// How long tap detection stays suppressed after the last speech frame —
 /// covers the brief pauses within a sentence so the gate doesn't flicker
 /// open between words.

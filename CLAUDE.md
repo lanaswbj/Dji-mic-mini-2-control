@@ -270,13 +270,13 @@ Windows-only concerns get their own modules:
   overlay window is created once at startup and only shown/hidden/repositioned afterward, not rebuilt
   per toggle. The six real slots (`pie_menu_select`): voice-dictation hold (Win+Ctrl, held until a
   later pairing-button press ends it — see `key_inject.rs`), Down, Up, Enter, types `"/btw "`, close.
-  Beyond that fixed menu, `hook_bridge.rs` can override what's showing with a pending question relayed
-  from Claude Code itself — a `PermissionRequest` choice or a single-select `AskUserQuestion` tool
-  call — complete with real title/option text in a small panel above the arc; an `AskUserQuestion`'s
-  implicit freeform "Other" choice reuses the same voice-dictation slot instead of a keypress. See
-  `gui/src/PieMenu.svelte` for the fan geometry (a half-circle "dome" shape, items placed along the
-  upper arc by simple trig, the question panel's `PIVOT_X`/`PIVOT_Y` split from the arc's own radius)
-  and the frontend-side open/close animation.
+  Beyond that fixed menu, `permission_server.rs` can override what's showing with a pending question
+  relayed from Claude Code itself — a `PermissionRequest` choice or a single-select `AskUserQuestion`
+  tool call — complete with real title/option text in a small panel above the arc; an
+  `AskUserQuestion`'s implicit freeform "Other" choice reuses the same voice-dictation slot instead of
+  a keypress. See `gui/src/PieMenu.svelte` for the fan geometry (a half-circle "dome" shape, items
+  placed along the upper arc by simple trig, the question panel's `PIVOT_X`/`PIVOT_Y` split from the
+  arc's own radius) and the frontend-side open/close animation.
 - `key_inject.rs` — `SendInput`-based keystroke simulation so a pie-menu slot can act on whatever
   application currently has focus, the same mechanism a hardware keyboard uses. `hold_win_ctrl_start`/
   `hold_win_ctrl_end` are separate key-down-only/key-up-only calls rather than one press-and-release
@@ -285,17 +285,55 @@ Windows-only concerns get their own modules:
   ends it). `type_text` uses Unicode key events rather than virtual-key codes so it isn't limited to
   characters with a virtual key on the current keyboard layout.
 - `hook_bridge.rs` — a loopback-only TCP listener (`127.0.0.1:47215`) that bridges Claude Code's own
-  hook events into the pie menu and `claude_status.rs`. `~/.claude/settings.json` (outside this repo)
-  registers a `"command"`-type hook per event that reads the event JSON off stdin and forwards it,
-  unmodified, via a plain PowerShell one-liner — chosen over the `"http"` hook type (which would let a
-  hook answer a permission request directly, skipping Claude Code's own prompt entirely) after that
-  approach was tried first, confirmed correctly registered, and confirmed reachable in isolation, but
-  never once received a real `PermissionRequest` event in practice; see the module's own doc comment
-  for the full story. Answering a question therefore means simulating the real keypress a human would
-  make into whatever terminal window is actually showing Claude Code's prompt (`key_inject.rs`), not a
-  Claude-Code-API decision channel. `HookPayload`'s fields are all `Option<T>` with no
-  `deny_unknown_fields`, so the same struct parses every event type without one event's payload shape
-  breaking another's.
+  *non-permission* lifecycle hook events (`PreToolUse`/`PostToolUse`/`Stop`/etc.) into the pie menu and
+  `claude_status.rs`. `~/.claude/settings.json` (outside this repo) registers a `"command"`-type hook
+  per event that reads the event JSON off stdin and forwards it, unmodified, via a plain PowerShell
+  one-liner that reads stdin as explicit UTF-8 (so non-ASCII payloads survive intact). Two jobs: (1) an
+  `AskUserQuestion`'s `PostToolUse` event auto-dismisses a stale pie-menu question overlay if it was
+  answered some other way than picking a pie-menu slot (typed directly in the terminal, or
+  `permission_server.rs`'s own "answer in terminal instead" escape hatch) — a no-op if the pie menu
+  already cleared its own pending-answer state when the pick happened there first; (2) every event with
+  a `hook_event_name` updates the coarse idle/thinking/working/error/attention tray-icon status
+  (`claude_status.rs`) — deliberately last-write-wins, not a precise per-session state machine, since
+  hooks are fire-and-forget with no request/response correlation. `HookPayload`'s fields are all
+  `Option<T>` with no `deny_unknown_fields`, so the same struct parses every event type without one
+  event's payload shape breaking another's. **Does not** handle permission decisions at all anymore —
+  see `permission_server.rs`.
+- `permission_server.rs` — a loopback-only **HTTP** server (`127.0.0.1:47216/permission`, one port up
+  from `hook_bridge.rs`'s raw-TCP port so the two never collide) registered in
+  `~/.claude/settings.json` as an `"http"`-type `PermissionRequest` hook — this is the real allow/deny
+  decision channel, not just a notification relay. An earlier iteration of this project believed the
+  `"http"` hook type never actually delivered real `PermissionRequest` events in practice and built
+  `hook_bridge.rs`'s keystroke-simulation fallback specifically to work around that; a later from-
+  scratch probe proved that belief **wrong** (or it was fixed by a newer Claude Code version) — the
+  `"http"` hook genuinely works as a decision channel, and a real decision response is honored with
+  zero terminal interaction. Key points, since this reverses what earlier notes in this file said:
+  - `AskUserQuestion` fires this exact same `PermissionRequest` hook (confirmed empirically, not
+    documented anywhere) rather than some separate mechanism — so both a plain tool needing Allow/Deny
+    and an interactive multi-choice question arrive at the identical endpoint, distinguished only by
+    `tool_name == "AskUserQuestion"`.
+  - The response body must be the `{"hookSpecificOutput":{"hookEventName":"PermissionRequest",
+    "decision":{"behavior":"allow"|"deny",...}}}` envelope — only that shape's `updatedInput` field
+    lets an `AskUserQuestion` answer be supplied directly (`answers: {question_text: chosen_label}`)
+    instead of falling back to Claude Code's own terminal picker, which is what makes answering a
+    question from the pie menu possible with **no keystroke injection, no focus stealing at all**.
+  - `QUEUE` (a `Mutex<VecDeque<PendingRequest>>`, only the front item ever shown via `show_front`)
+    exists because requests routinely overlap in practice — this very Claude Code session (the one
+    that built this file) is itself a constant client of this exact server, so a human's separate
+    session can easily have its own request in flight at the same moment. An earlier single-`Option`-
+    slot design let a second arrival silently overwrite the first, which surfaced as two real bugs at
+    once: "Allow" appearing to do nothing (the visible card's request had already been denied out from
+    under it) and the overlay flashing/re-focusing on every new arrival regardless of one already being
+    shown.
+  - No `permission_mode`-based gating — an earlier version auto-allowed everything except `default`
+    mode, on the theory that only `default` genuinely needs a human decision; real use falsified that
+    (a Bash command in `acceptEdits` mode, which only auto-accepts *file edits*, still fired this hook
+    expecting a real answer). Every request now pops the pie menu and waits, full stop, since Claude
+    Code firing the hook at all already means it wants an answer.
+  - "Allow, don't ask again" persists matching `permission_suggestions` rules into
+    `{cwd}/.claude/settings.local.json`'s `permissions.allow` array — the same file/format Claude
+    Code's own `destination: "localSettings"` suggestions target — best-effort (a failed read/merge/
+    write still lets the already-decided allow proceed, just without being remembered).
 
 **Frontend** (`gui/src`): Svelte 5, poll-based throughout (no Tauri event emission anywhere in the
 codebase, *except* `pie-menu:open`, which `pie_menu.rs` emits to reset the overlay's selection each
@@ -309,3 +347,158 @@ buttons calling `micTapReportFalsePositive`/`micTapReportFalseNegative` (see `ta
 a status line polling `micTapTrainingStatus` every 2s (model source/age, pending-feedback count,
 idle-vs-training state), and rollback/restore-factory buttons — all Simplified Chinese copy, matching
 the rest of the app.
+
+## Project layout
+
+```text
+Cargo.toml                       Workspace root: protocol/device/cli/tap-model/gui-src-tauri members
+CLAUDE.md                        This file
+README.md                        User-facing feature list and setup instructions (Simplified Chinese)
+PROTOCOL.md                      Byte-level DUML framing/CRC/packet-shape reverse-engineering notes
+deny.toml                        `cargo deny` license allowlist
+build-release.ps1                Windows release build (portable exe + NSIS installer) — see Commands
+build-release.sh                 Linux/macOS-upstream equivalent; explicitly rejects Darwin
+LICENSE                          Unlicense (this repo); third-party deps/models keep their own licenses
+reference.txt                    Upstream project URLs this repo was forked/adapted from (see README 致谢)
+dark.png / light.png / zadig.png Screenshots/assets referenced by README and the Zadig driver installer
+Release/                         Build output of build-release.ps1 (portable exe + installer); gitignored
+target/                          Cargo build artifacts; gitignored
+native/                          Empty — harmless upstream leftover, not used by anything
+
+crates/
+  protocol/                      Pure DUML framing/CRC/per-model command+decode logic, zero I/O
+    src/models/                  One file per supported mic model, registered in `models/mod.rs`'s MODELS
+  device/                        USB transport (nusb) + multi-device orchestration; depends on protocol
+    src/manager.rs                 DeviceManager: bus rescan, adopt/drop, blocking list/status/set/set_tx API
+    src/actor.rs                   Per-device OS thread running a futures-lite async read/write loop
+  cli/                            One-shot CLI front-end (djimic binary); depends on device only
+  tap-model/                      Mic-tap classifier: model format, forward pass, training, hot-swap store —
+                                  shared by gui/src-tauri (inference) and test-tools/detect-test (training).
+                                  Nothing to do with the DJI wire protocol — see its own paragraph above.
+    default_model.json              Checked-in embedded baseline (regenerate: `detect-test train --bake-default`)
+    src/lib.rs                      TapModel, TapModelStore, train/continue_training, Rng
+    src/features.rs                 Goertzel bands, spectral summary, attack shape, NoveltyState, VadState
+
+gui/                              Tauri 2 + Svelte 5 desktop app — the shipped product
+  src-tauri/                      Rust backend
+    src/main.rs                     App wiring: tray icon/menu, single-instance, autostart, close-to-tray
+    src/commands.rs                 General snapshot/set-setting Tauri commands (device list/status/settings)
+    src/driver.rs                   One-click WinUSB driver install (downloads+verifies signed Zadig)
+    src/pairing_button.rs           Pairing-button press detection via Win32 Raw Input API
+    src/volume_guard.rs             Neutralizes the pairing button's system-volume side effect
+    src/mic_tap.rs                  Mic-shell-tap detection — see its own paragraph above
+    src/tap_feedback.rs             Incremental training from in-app user feedback — see above
+    src/shortcut.rs                 Receiver-button-remap stub, always unavailable on Windows
+    src/pie_menu.rs                 Ctrl+Alt+P pie-menu overlay (also renders pending hook questions)
+    src/key_inject.rs               SendInput-based keystroke simulation for pie-menu actions
+    src/hook_bridge.rs              Non-permission Claude Code hook events -> pie menu / tray status
+    src/permission_server.rs        Claude Code PermissionRequest/AskUserQuestion http-hook decision server
+    src/claude_status.rs            Coarse idle/thinking/working/error/attention atomic for the tray badge
+    capabilities/pie-menu.json      Tauri capability grant for the separate "pie-menu" window
+    icons/                          App/tray icons baked in via include_bytes!
+  src/                             Svelte 5 frontend
+    App.svelte                       Root component for the "main" window (device list + settings)
+    PieMenu.svelte                   Root component for the "pie-menu" window (see pie_menu.rs)
+    main.js                          Picks which root component to mount based on window label
+    lib/api.js                       Sole invoke() wrapper layer — add new Tauri commands here
+    lib/DevicePanel.svelte           Per-device settings panel (NC mode, voice tone, LEDs, etc.)
+    lib/ReceiverShortcut.svelte      "接收器快捷键" tab — pairing/tap test status + tap feedback panel
+    lib/Sidebar.svelte               Device list sidebar
+    lib/*Control.svelte, *Picker.svelte, *Artwork.svelte, *Icon.svelte, *Picto.svelte
+                                     Small presentational settings-control/artwork components
+    lib/UdevModal.svelte             Linux udev-rule setup instructions modal
+    lib/txCovers.js                  Static asset map for Mic Mini 2 cover-color artwork
+
+test-tools/detect-test/          Standalone crate OUTSIDE the Cargo workspace (own empty [workspace]
+                                  table) — fast `cargo run` iteration for mic-tap/pairing-button
+                                  detection without rebuilding the full Tauri app; depends on
+                                  crates/tap-model via a plain path dep (no shared workspace membership
+                                  needed for that). See "Commands" above for its subcommands.
+  data/samples.csv                Collected training data (label + 21 raw feature columns, append-only)
+  data/samples.csv.bak-*          Auto-backed-up previous-schema data (see CSV_HEADER mismatch handling)
+
+packaging/                        Linux-only packaging leftovers from the cross-platform upstream
+  60-dji-mic.rules                  udev rule granting non-root USB access to the vendor control interface
+  postinstall.sh / postremove.sh    udev-rule install/removal hooks for a .deb/.rpm-style package
+```
+
+## Dependencies
+
+Kept deliberately light — no ML framework, no async runtime beyond `futures-lite`, no heavy DSP/audio
+stack beyond what `cpal` requires. When adding a dependency, prefer a small, focused, pure-Rust crate
+over one that pulls in a runtime/toolchain of its own (the project has twice removed a dependency for
+exactly this reason — see `ort`/`voice_activity_detector` below).
+
+**Workspace-wide** (`Cargo.toml`'s `[workspace.dependencies]`): `serde`/`serde_json` (data model +
+on-disk formats), `thiserror`/`anyhow` (error types), `nusb` (cross-platform USB), `futures-lite`/
+`async-channel` (the per-device actor's async loop — deliberately not tokio), `clap` (CLI arg parsing).
+
+- **`crates/protocol`** — `serde` only (plus `serde_json` as a dev-dependency for tests). Pure logic,
+  no I/O, so nothing else is needed.
+- **`crates/device`** — `protocol`, `nusb`, `futures-lite`, `async-channel`, `thiserror`, `serde`.
+- **`crates/cli`** — `device`, `clap`, `serde_json`, `anyhow`.
+- **`crates/tap-model`** — `serde`/`serde_json` (the `TapModel` on-disk format), `arc-swap` (lock-free
+  hot-swap store — a tiny, single-purpose crate, not a general concurrency framework), `microdsp`
+  (spectral-flux onset novelty — a mature MIR/percussive-onset technique, cheaper and more reliable
+  than a hand-rolled "how sudden is this" heuristic), `earshot` 1.x (pure-Rust neural-net VAD — see the
+  weight-history/VAD note above for why this replaced `voice_activity_detector`+`ort`).
+- **`gui/src-tauri`** — `device`, `tap-model`, `tauri` (`image-png`/`tray-icon` features),
+  `tauri-plugin-single-instance`, `tauri-plugin-autostart`, `serde`/`serde_json`.
+  Windows-only (`[target.'cfg(windows)'.dependencies]`): `cpal` (audio capture for mic-tap detection),
+  `windows` (Win32 API bindings — Raw Input, `SendInput`, Com, audio endpoint volume control, threading;
+  feature-gated to just the API families actually used). Unix-only: `libc`/`signal-hook` (upstream
+  cross-platform leftovers, not exercised on the Windows-only shipped build).
+- **`test-tools/detect-test`** — `cpal`, `serde_json`, `tap-model` (path dep, see "Project layout").
+  Windows-only: `windows` (Raw Input for its own pairing-button test path, `Win32_Graphics_Gdi`).
+- **Build-time**: `tauri-build` (`gui/src-tauri`'s `build.rs` codegen).
+
+**Deliberately avoided** (with a documented reason, so they aren't re-added by accident):
+- `ort` + `voice_activity_detector` (Silero VAD) — replaced by `earshot` 1.x: `ort` downloads a
+  prebuilt ONNX Runtime at build time and pins a pre-1.0 `ort` release candidate, the single heaviest
+  and most build-fragile dependency the app ever had, purely for one speech-gate.
+- `linfa`/`tch`/`candle`/any ML framework — the mic-tap classifier (including its small 1D-conv path,
+  see `crates/tap-model` above) is hand-rolled with plain `Vec<f32>` math instead; the model is small
+  enough that hand-derived forward/backward passes (verified with a numeric gradient-check test) are
+  both sufficient and easier to reason about than pulling in a framework's dependency tree.
+- `rand`/`rand_distr` — `tap-model::Rng` is a ~10-line hand-rolled xorshift64 PRNG (weight init) plus a
+  Box-Muller transform (Gaussian jitter for data augmentation); not worth a dependency for this little.
+- `hound` — was used only for an optional `DJIMIC_DEBUG=1` "dump what the VAD hears" WAV file in
+  `detect-test`'s old Silero-based `VadState`; dropped when VAD moved into the shared, hound-free
+  `tap-model::features::VadState`. Raw-audio retention during `collect` (so a future feature-vector
+  change wouldn't require a brand-new recording session) was identified as a valuable follow-up but not
+  implemented — reintroducing `hound` for that is the natural way to do it.
+- tokio — the USB actor loop (`crates/device/src/actor.rs`) uses `futures-lite`/`async-channel` instead;
+  no part of this codebase needs a full async runtime.
+
+## Known limitations / open items
+
+Things flagged during development as genuinely unfinished or unvalidated, consolidated here so they
+don't have to be rediscovered by grepping for "TODO" (there isn't one — each item below is discussed
+in more depth at the file/bullet cited):
+
+- **`shortcut.rs`** — the receiver-button-remap feature (short-press receiver → `Fn+Control`) is a stub
+  ported from a removed macOS-only implementation (CGEventTap + `hidutil`); it always reports
+  unavailable on Windows. No Windows implementation exists yet.
+- **earshot 1.x VAD accuracy** — its accuracy claims are the author's own self-benchmark, not this
+  project's. Real-hardware validation happens through `detect-test`'s loud/exaggerated-speech
+  collection phase and, in production, through the GUI's false-positive/false-negative feedback
+  buttons (see `tap_feedback.rs`) — ongoing via actual use, not a one-time check that's already closed
+  out.
+- **Volume OSD flash on pairing-button press** — `volume_guard.rs` keeps the OSD popup suppressed for
+  the app's whole runtime and restores volume/mute state shortly after every press, but an earlier
+  press-triggered one-shot suppression attempt still let it flash occasionally for reasons never root-
+  caused; the always-on approach shipped instead because it works in practice, not because the root
+  cause was found.
+- **Raw-audio retention during `collect`** — identified as a valuable follow-up (so a future
+  feature-vector change wouldn't force an entirely new recording session) but not implemented;
+  reintroducing `hound` (previously removed — see Dependencies above) is the natural way to do it if
+  this is ever picked up.
+- **`test-tools/detect-test/data/samples.csv`** is append-only and grows every `collect`/
+  `collect-extra`/`collect-friction` run — it accumulates across many separate recording sessions over
+  time rather than being replaced, so it can grow to hundreds of thousands of rows. `run_train`'s
+  full-batch gradient descent (3000 epochs, `TRAIN_AUGMENT_FACTOR = 15` on top of that for the minority
+  tap class) re-processes the entire file every epoch with no subsampling, so retraining time scales
+  with however large the file has grown — a training run can legitimately take longer than it used to
+  as more data is collected, this is not a hang. (A Python prototyping script used earlier to find the
+  label-cleaning/augmentation recipe did subsample the majority class for speed, but that subsampling
+  was never carried into the production Rust `train_inner` — full-batch is what actually ships.)
