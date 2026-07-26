@@ -1,49 +1,347 @@
+/*
+ * Design tokens — the single source of truth for every color, size, and timing
+ * in this app. See design-system/dji-mic-control/MASTER.md for the reasoning
+ * behind each value (contrast math, type scale, spring derivation).
+ *
+ * Components must never hardcode a hex, an rgba, or a transition duration.
+ */
+
 :root {
-  /* Light theme */
-  --bg: #f4f5f7;
-  --bg-panel: #ffffff;
-  --bg-elev: #fbfbfc;
-  --border: #e2e4e9;
-  --border-strong: #cfd3da;
-  --text: #1b1d21;
-  --text-dim: #6b7280;
-  --text-faint: #9aa0aa;
-  --accent: #2f7de1;
-  --accent-contrast: #ffffff;
-  --accent-soft: rgba(47, 125, 225, 0.12);
-  --good: #21a065;
-  --warn: #d98324;
-  --danger: #d64545;
-  --shadow: 0 1px 2px rgba(16, 18, 22, 0.06), 0 6px 18px rgba(16, 18, 22, 0.06);
-  /* Negative horizontal spread so the shadow falls downward, not sideways into
-     an adjacent multi-column card. */
-  --shadow-card: 0 1px 2px rgba(16, 18, 22, 0.06), 0 6px 16px -8px rgba(16, 18, 22, 0.18);
-  --radius: 12px;
-  --radius-sm: 8px;
   color-scheme: light;
+
+  /* --- Surfaces & text -------------------------------------------------
+     Every text/surface pair below is computed, not eyeballed. Light-mode
+     ratios: text 17.6:1, secondary 6.2:1, tertiary 5.3:1 (and 4.50:1 on
+     --surface-sunken, its worst case). --text-tertiary is the darkest text
+     token there is; nothing dimmer may be added.
+
+     The three surfaces that also exist as a *material* (see below) are stored
+     as bare `R G B` channel triples, so the exact same color can be used
+     opaque and translucent without one of the two copies drifting from the
+     other — which is what happened when --material-sidebar was a literal
+     rgba() that no longer matched --canvas. */
+  --canvas-rgb: 242 243 245;
+  --surface-rgb: 255 255 255;
+  --raised-rgb: 255 255 255;
+
+  --canvas: rgb(var(--canvas-rgb));
+  --surface: rgb(var(--surface-rgb));
+  --surface-raised: rgb(var(--raised-rgb));
+  --surface-sunken: #ebedf0;
+  --text: #16181c;
+  --text-secondary: #5a616e;
+  --text-tertiary: #656c79;
+  --border: #e0e3e8;
+  --border-strong: #c6cbd4;
+
+  /* --- Accent ---------------------------------------------------------- */
+  --accent: #1f6feb;
+  --accent-on: #ffffff; /* 4.64:1 on --accent */
+  --accent-soft: rgb(31 111 235 / 0.1);
+
+  /* --- Status ---------------------------------------------------------- */
+  --ok: #1a7f4b;
+  --ok-soft: rgb(26 127 75 / 0.12);
+  --warn: #9a6410;
+  --warn-soft: rgb(154 100 16 / 0.12);
+  --danger: #c02626;
+  --danger-soft: rgb(192 38 38 / 0.12);
+
+  /* --- Materials -------------------------------------------------------
+     Translucent layers that content scrolls *under* (Apple: chrome is a
+     floating material, not an opaque strip). Never stack two of these.
+
+     The window itself is transparent and carries a Mica backdrop (see
+     tauri.conf.json), so these alphas are what actually lets the desktop
+     through. Material weight encodes hierarchy, exactly as Apple describes
+     it: the sidebar is the thinnest (it is structure, it should recede), the
+     content plane is the thickest (it is where reading happens), chrome sits
+     between them. Cards stay fully opaque on purpose — a translucent card on
+     a translucent content plane is the one stack the rule forbids.
+
+     Each alpha is its own token so `--translucent="off"` (偏好设置 → 外观, and
+     the two a11y media queries below) can flatten all four to 1 in one place
+     instead of every component knowing about the preference. */
+  --glass-chrome: 0.66;
+  --glass-sidebar: 0.56;
+  --glass-content: 0.86;
+  --glass-popover: 0.86;
+
+  --material-chrome: rgb(var(--surface-rgb) / var(--glass-chrome));
+  --material-sidebar: rgb(var(--canvas-rgb) / var(--glass-sidebar));
+  --material-content: rgb(var(--canvas-rgb) / var(--glass-content));
+  --material-popover: rgb(var(--raised-rgb) / var(--glass-popover));
+  --blur-chrome: blur(20px) saturate(180%);
+  --blur-sidebar: blur(24px) saturate(140%);
+  --blur-popover: blur(28px) saturate(180%);
+
+  /* --- Elevation -------------------------------------------------------
+     Bigger surfaces read as thicker: deeper shadow the higher the layer. */
+  --elev-1: 0 1px 2px rgb(16 18 22 / 0.05), 0 2px 8px -4px rgb(16 18 22 / 0.1);
+  --elev-2: 0 1px 2px rgb(16 18 22 / 0.06), 0 8px 20px -8px rgb(16 18 22 / 0.16);
+  --elev-3: 0 2px 4px rgb(16 18 22 / 0.06), 0 16px 40px -12px rgb(16 18 22 / 0.24);
+  --elev-4: 0 4px 8px rgb(16 18 22 / 0.08), 0 32px 64px -16px rgb(16 18 22 / 0.32);
+  /* Dark mode adds a top light-catch edge here; transparent in light mode. */
+  --edge-highlight: 0 0 0 0 transparent;
+  --scrim: rgb(10 12 16 / 0.48);
+
+  /* --- Fixed (deliberately un-themed) ----------------------------------
+     The handful of values that must look the same in both themes, because
+     what they sit on is the same in both themes: a switch knob reads as one
+     physical white object catching light, the Windows close button's glyph
+     sits on the same red fill either way, and a hairline around a color chip
+     has to relate to that chip's own color rather than to the page's. They
+     are still tokens so the exceptions stay enumerable here instead of
+     hiding as literals in five component style blocks. */
+  --fixed-white: #ffffff;
+  --knob-shadow: 0 1px 2px rgb(0 0 0 / 0.28);
+  --swatch-ring: inset 0 0 0 1px rgb(0 0 0 / 0.2);
+  --swatch-ring-gloss: inset 0 0 0 1px rgb(0 0 0 / 0.16),
+    inset 0 1px 1px rgb(255 255 255 / 0.4);
+  /* The pie menu floats over the desktop rather than over an app surface, so
+     it carries a fixed dark drop-shadow instead of an --elev-* box-shadow. */
+  --shadow-overlay: drop-shadow(0 8px 16px rgb(0 0 0 / 0.4));
+
+  /* --- Spacing (4/8 rhythm) --------------------------------------------
+     --space-05 is the single half-step, for the two places where the gap has
+     to say "these are one thing": a label and the value directly under it,
+     and the rows of a tightly packed list. At --space-1 both read as
+     separated. Everything else stays on the 4/8 rhythm. */
+  --space-05: 2px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* --- Radius (scales with the element it wraps) ----------------------- */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-full: 999px;
+
+  /* --- Icons (exactly three sizes) ------------------------------------- */
+  --icon-sm: 16px;
+  --icon-md: 20px;
+  --icon-lg: 24px;
+
+  /* --- Motion ----------------------------------------------------------
+     --ease-spring is a real critically-damped spring (damping 1.0,
+     response 0.35s) sampled from x(t) = 1 - (1 + wt)e^(-wt). It has no
+     overshoot, and reaches 90% of its travel at ~210ms — inside the
+     150-300ms perceptual window even though it settles at 480ms. */
+  --dur-press: 90ms;
+  --dur-fast: 160ms;
+  --dur-base: 240ms;
+  --dur-spring: 480ms;
+  /* Looping indicator rhythms. Not transitions: these repeat for as long as
+     the state they report lasts, so they are tuned for "alive but ignorable"
+     rather than for the 150-300ms perceptual window above. */
+  --dur-spin: 720ms;
+  --dur-pulse: 1.1s;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: linear(
+    0, 0.114, 0.319, 0.514, 0.669, 0.781, 0.859, 0.91, 0.944, 0.965, 0.979,
+    0.987, 0.992, 0.995, 0.997, 0.998, 1
+  );
+  --ease-momentum: cubic-bezier(0.34, 1.4, 0.44, 1);
+
+  /* --- Typography ------------------------------------------------------
+     Tracking is size-specific: large text tightens, body sits at 0, the
+     uppercase label opens up. One fixed letter-spacing is wrong somewhere. */
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Display",
+    "Segoe UI", "Microsoft YaHei UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "SFMono-Regular", Consolas,
+    "Liberation Mono", monospace;
+
+  --type-display-size: 1.75rem; /* 28px */
+  --type-display-line: 1.15;
+  --type-display-track: -0.02em;
+
+  --type-title-size: 1.25rem; /* 20px */
+  --type-title-line: 1.25;
+  --type-title-track: -0.015em;
+
+  --type-title-sm-size: 1rem; /* 16px */
+  --type-title-sm-line: 1.35;
+  --type-title-sm-track: -0.01em;
+
+  --type-body-size: 0.875rem; /* 14px */
+  --type-body-line: 1.5;
+
+  --type-caption-size: 0.8125rem; /* 13px */
+  --type-caption-line: 1.5;
+  --type-caption-track: 0.005em;
+
+  --type-label-size: 0.75rem; /* 12px — the floor. Nothing smaller. */
+  --type-label-line: 1.4;
+  --type-label-track: 0.06em;
+
+  /* --- Layout ---------------------------------------------------------- */
+  --titlebar-h: 44px;
+  --sidebar-w: 232px;
+  --measure: 72ch;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #16181d;
-    --bg-panel: #1e2127;
-    --bg-elev: #23262e;
-    --border: #2c313a;
-    --border-strong: #3a4048;
-    --text: #e9ebef;
-    --text-dim: #9aa1ad;
-    --text-faint: #6d7682;
-    --accent: #5b9bf0;
-    --accent-contrast: #0d1117;
-    --accent-soft: rgba(91, 155, 240, 0.16);
-    --good: #37c185;
-    --warn: #e0a250;
-    --danger: #eb6a6a;
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.3);
-    --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35), 0 6px 16px -8px rgba(0, 0, 0, 0.6);
+  :root:not([data-theme="light"]) {
     color-scheme: dark;
+
+    --canvas-rgb: 18 20 24;
+    --surface-rgb: 26 29 35;
+    --raised-rgb: 34 38 46;
+    --surface-sunken: #0e1014;
+    --text: #eceef2;
+    --text-secondary: #98a0af;
+    --text-tertiary: #868f9f;
+    --border: #2b3039;
+    --border-strong: #3b424e;
+
+    --accent: #4d93f0;
+    /* Near-black, not white: white on #4d93f0 is only 3.1:1. */
+    --accent-on: #0e1014;
+    --accent-soft: rgb(77 147 240 / 0.16);
+
+    --ok: #3ecf8e;
+    --ok-soft: rgb(62 207 142 / 0.16);
+    --warn: #e8b055;
+    --warn-soft: rgb(232 176 85 / 0.16);
+    --danger: #f2777a;
+    --danger-soft: rgb(242 119 122 / 0.16);
+
+    /* Dark Mica is much darker than light Mica, so the same alpha reads as
+       more transparent; the content plane is nudged up to keep body text on
+       a stable ground. The materials themselves are derived from the channel
+       tokens above and need no restating. */
+    --glass-content: 0.88;
+
+    /* Pure-black shadows are invisible on a dark canvas, so depth comes from
+       a top light-catch edge instead (Apple: light catching the material). */
+    --elev-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 2px 8px -4px rgb(0 0 0 / 0.5);
+    --elev-2: 0 1px 2px rgb(0 0 0 / 0.45), 0 8px 20px -8px rgb(0 0 0 / 0.6);
+    --elev-3: 0 2px 4px rgb(0 0 0 / 0.5), 0 16px 40px -12px rgb(0 0 0 / 0.7);
+    --elev-4: 0 4px 8px rgb(0 0 0 / 0.55), 0 32px 64px -16px rgb(0 0 0 / 0.8);
+    --edge-highlight: inset 0 1px 0 rgb(255 255 255 / 0.05);
+    --scrim: rgb(0 0 0 / 0.58);
   }
 }
+
+/* Explicit theme override (偏好设置 → 外观). Duplicated rather than shared
+   with the media query because CSS has no way to OR a media query with an
+   attribute selector, and the toggle must beat the system preference in both
+   directions. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --canvas-rgb: 18 20 24;
+  --surface-rgb: 26 29 35;
+  --raised-rgb: 34 38 46;
+  --surface-sunken: #0e1014;
+  --text: #eceef2;
+  --text-secondary: #98a0af;
+  --text-tertiary: #868f9f;
+  --border: #2b3039;
+  --border-strong: #3b424e;
+
+  --accent: #4d93f0;
+  --accent-on: #0e1014;
+  --accent-soft: rgb(77 147 240 / 0.16);
+
+  --ok: #3ecf8e;
+  --ok-soft: rgb(62 207 142 / 0.16);
+  --warn: #e8b055;
+  --warn-soft: rgb(232 176 85 / 0.16);
+  --danger: #f2777a;
+  --danger-soft: rgb(242 119 122 / 0.16);
+
+  --glass-content: 0.88;
+
+  --elev-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 2px 8px -4px rgb(0 0 0 / 0.5);
+  --elev-2: 0 1px 2px rgb(0 0 0 / 0.45), 0 8px 20px -8px rgb(0 0 0 / 0.6);
+  --elev-3: 0 2px 4px rgb(0 0 0 / 0.5), 0 16px 40px -12px rgb(0 0 0 / 0.7);
+  --elev-4: 0 4px 8px rgb(0 0 0 / 0.55), 0 32px 64px -16px rgb(0 0 0 / 0.8);
+  --edge-highlight: inset 0 1px 0 rgb(255 255 255 / 0.05);
+  --scrim: rgb(0 0 0 / 0.58);
+}
+
+/* --- Accessibility preferences -----------------------------------------
+   Three independent signals, all honored. Reduced motion is not "no
+   feedback" — it's a gentler, non-vestibular equivalent, so opacity and
+   color changes survive while travel and springs do not. */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: var(--dur-fast) !important;
+    transition-timing-function: ease !important;
+    scroll-behavior: auto !important;
+  }
+  :root {
+    --dur-press: 1ms;
+    --dur-base: var(--dur-fast);
+    --dur-spring: var(--dur-fast);
+    --ease-spring: ease;
+    --ease-momentum: ease;
+  }
+}
+
+/* Glass off. Three independent signals want the identical result — the user's
+   own 外观 → 窗口材质 preference, and the two system settings — and CSS has no
+   way to share one declaration block between a selector and a media query, so
+   it is written three times for the same reason the dark palette above is
+   written twice. Flattening the *alphas* rather than reassigning each
+   --material-* means a material added later is covered without being
+   remembered here. Must stay below every theme block: these selectors tie with
+   the theme ones on specificity, so source order is what makes them win. */
+:root[data-translucent="off"] {
+  --glass-chrome: 1;
+  --glass-sidebar: 1;
+  --glass-content: 1;
+  --glass-popover: 1;
+  --blur-chrome: none;
+  --blur-sidebar: none;
+  --blur-popover: none;
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --glass-chrome: 1;
+    --glass-sidebar: 1;
+    --glass-content: 1;
+    --glass-popover: 1;
+    --blur-chrome: none;
+    --blur-sidebar: none;
+    --blur-popover: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --glass-chrome: 1;
+    --glass-sidebar: 1;
+    --glass-content: 1;
+    --glass-popover: 1;
+    --blur-chrome: none;
+    --blur-sidebar: none;
+    --blur-popover: none;
+    --border: var(--text-secondary);
+    --border-strong: var(--text);
+    --text-secondary: var(--text);
+    --text-tertiary: var(--text);
+  }
+}
+
+/* --- Base --------------------------------------------------------------- */
 
 * {
   box-sizing: border-box;
@@ -56,21 +354,173 @@ body,
   margin: 0;
 }
 
+/* Transparent, not --canvas: the window carries a Mica backdrop and the app
+   shell paints every pixel of it itself (chrome / sidebar / content plane),
+   each at its own material weight. An opaque body would sit under all three
+   and cancel the effect. */
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
-    Arial, sans-serif;
-  font-size: 14px;
-  background: var(--bg);
+  font-family: var(--font-ui);
+  font-size: var(--type-body-size);
+  line-height: var(--type-body-line);
+  background: transparent;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
   overflow: hidden;
 }
 
 button {
   font: inherit;
+  color: inherit;
   cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+h1,
+h2,
+h3,
+p,
+ul,
+ol,
+dl,
+dd,
+figure {
+  margin: 0;
+}
+
+/* The heading ladder is one ladder for the whole app — section h1
+   (SectionHeader) -> card h2 -> sub-block h3 — so the two card-level steps
+   are defined once here rather than restated in every component that renders
+   a heading (where one copy had already drifted and lost its line-height and
+   tracking). */
+h2,
+h3 {
+  font-size: var(--type-title-sm-size);
+  line-height: var(--type-title-sm-line);
+  letter-spacing: var(--type-title-sm-track);
+  font-weight: 620;
+}
+
+/* One focus ring for the whole app. Never removed — only replaced. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
 }
 
 ::selection {
   background: var(--accent-soft);
+}
+
+/* Slim, theme-aware scrollbars — the OS default light scrollbar on a dark
+   panel is one of the loudest "unfinished app" tells on Windows. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  border-radius: var(--radius-full);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+  background-clip: content-box;
+}
+
+/* --- Shared utility classes --------------------------------------------
+   Kept tiny on purpose; anything reusable beyond this belongs in lib/ui/. */
+
+.u-label {
+  font-size: var(--type-label-size);
+  line-height: var(--type-label-line);
+  letter-spacing: var(--type-label-track);
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.u-caption {
+  font-size: var(--type-caption-size);
+  line-height: var(--type-caption-line);
+  letter-spacing: var(--type-caption-track);
+  color: var(--text-secondary);
+}
+
+.u-num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* An icon leading a line of text that is allowed to wrap.
+   Four components had grown their own copy of this, all with
+   `align-items: center` — which is right for one line and visibly wrong for
+   two, parking the glyph halfway down the paragraph. The icon belongs on the
+   *first* line, optically centered against that line box rather than flush
+   with its top (a 16px glyph in a 19.5px caption line box needs ~1.75px). */
+.u-icon-line {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.u-icon-line > :first-child {
+  margin-top: calc(
+    (var(--type-caption-size) * var(--type-caption-line) - var(--icon-sm)) / 2
+  );
+}
+
+/* Long-form prose is held to the 72ch measure wherever it appears. */
+.u-measure {
+  max-width: var(--measure);
+}
+
+/* A short definition list of facts — serial, firmware, port, sample count.
+   Five components had each grown their own near-identical copy of this grid.
+   The only thing that ever legitimately differed between them was how narrow
+   a column may get before the list rewraps, so that is the one thing left
+   adjustable, via --fact-min on the list itself. */
+.u-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(var(--fact-min, 140px), 1fr));
+  gap: var(--space-3) var(--space-5);
+}
+
+.u-facts > div {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-05);
+  min-width: 0;
+}
+
+.u-facts dd {
+  font-size: var(--type-caption-size);
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.u-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }

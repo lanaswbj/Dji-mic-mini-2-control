@@ -44,6 +44,6 @@
   .picto {
     display: block;
     object-fit: contain;
-    color: var(--text-dim);
+    color: inherit;
   }
 </style>

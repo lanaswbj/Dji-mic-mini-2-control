@@ -160,6 +160,69 @@ static PREVIOUS_FOREGROUND: AtomicIsize = AtomicIsize::new(0);
 /// it open (see `pie_menu_select`'s doc comment for why).
 const CLOSE_INDEX: u32 = 5;
 
+/// The global hotkey, spelled the way a human reads it. Kept next to the
+/// `RegisterHotKey` call below so the string and the registration can't drift.
+pub const HOTKEY_LABEL: &str = "Ctrl + Alt + P";
+
+/// One entry per fixed slot, in the same order `pie_menu_select` dispatches
+/// on and `PieMenu.svelte` draws.
+#[derive(serde::Serialize)]
+pub struct PieSlot {
+    pub index: u32,
+    pub icon: &'static str,
+    pub label: &'static str,
+    pub effect: &'static str,
+}
+
+/// What the six default slots do — the single source of truth, right beside
+/// the `match index` in `pie_menu_select` that implements them. The main
+/// window's 快捷菜单 section renders this rather than a hand-copied list, so
+/// a slot can never be described as doing something it doesn't.
+const SLOTS: [PieSlot; 6] = [
+    PieSlot {
+        index: 0,
+        icon: "mic",
+        label: "语音输入",
+        effect: "按住 Win + Ctrl 开始听写，再按一次配对键结束",
+    },
+    PieSlot {
+        index: 1,
+        icon: "chevron-down",
+        label: "向下",
+        effect: "发送 ↓ 方向键",
+    },
+    PieSlot {
+        index: 2,
+        icon: "chevron-up",
+        label: "向上",
+        effect: "发送 ↑ 方向键",
+    },
+    PieSlot {
+        index: 3,
+        icon: "corner-down-left",
+        label: "确认",
+        effect: "发送 Enter",
+    },
+    PieSlot {
+        index: 4,
+        icon: "keyboard",
+        label: "顺带一提",
+        effect: "输入 “/btw ”",
+    },
+    PieSlot {
+        index: CLOSE_INDEX,
+        icon: "x",
+        label: "关闭",
+        effect: "收起快捷菜单",
+    },
+];
+
+/// Describe the fixed slots for the main window.
+#[tauri::command]
+pub fn pie_menu_slots() -> &'static [PieSlot] {
+    &SLOTS
+}
+
 /// What kind of question is currently pending an answer, and what
 /// `pie_menu_answer_question` needs to know to answer it — set by
 /// `show_question`, taken (read-and-cleared) by `pie_menu_answer_question`

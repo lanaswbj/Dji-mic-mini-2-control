@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use device::{DeviceManager, DeviceStatus, DeviceSummary, Os, Probe, Setting};
 use serde::Serialize;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_autostart::ManagerExt;
 
 /// Everything the UI needs for one render, fetched in a single call.
 #[derive(Serialize)]
@@ -78,6 +79,51 @@ pub fn set_tx_setting(
 ) -> Result<(), String> {
     mgr.set_tx(&device, tx, &setting, &value)
         .map_err(|e| e.to_string())
+}
+
+/// App-level facts the 偏好设置 section needs.
+///
+/// Everything here is read from the one place that actually owns it — the
+/// autostart plugin, `pie_menu`'s registered hotkey, the two loopback
+/// listeners' own port constants — rather than restated in the frontend,
+/// where it would silently rot the first time one of them changed. The two
+/// ports in particular were previously bound with no disclosure anywhere in
+/// the UI; a settings screen that names them is the point.
+#[derive(Serialize)]
+pub struct AppInfo {
+    pub version: String,
+    pub os: Os,
+    pub autostart: bool,
+    pub pie_menu_hotkey: String,
+    pub hook_port: u16,
+    pub permission_port: u16,
+}
+
+/// Read app-level state for the preferences screen.
+#[tauri::command]
+pub fn app_info(app: AppHandle) -> AppInfo {
+    AppInfo {
+        version: app.package_info().version.to_string(),
+        os: device::current_os(),
+        autostart: app.autolaunch().is_enabled().unwrap_or(false),
+        pie_menu_hotkey: crate::pie_menu::HOTKEY_LABEL.to_string(),
+        hook_port: crate::hook_bridge::PORT,
+        permission_port: crate::permission_server::PORT,
+    }
+}
+
+/// Turn launch-at-login on or off. The tray menu has the same toggle; both
+/// funnel through the plugin, so whichever one you use the other reflects it
+/// on its next rebuild.
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let auto = app.autolaunch();
+    if enabled {
+        auto.enable()
+    } else {
+        auto.disable()
+    }
+    .map_err(|e| e.to_string())
 }
 
 /// The udev rule and instructions for Linux setup.

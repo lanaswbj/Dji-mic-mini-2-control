@@ -144,7 +144,7 @@ use crate::pie_menu;
 /// the `"http"` hook at (`http://127.0.0.1:47216/permission`). One higher
 /// than `hook_bridge`'s raw-TCP command-hook port (47215) so the two never
 /// collide.
-const PORT: u16 = 47216;
+pub const PORT: u16 = 47216;
 
 /// How long the pop-and-wait path waits for a pie-menu pick before giving up
 /// and denying. Comfortably under Claude Code's own 600s http-hook timeout,

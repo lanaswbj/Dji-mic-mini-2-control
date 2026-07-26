@@ -36,7 +36,7 @@
       ? "var(--danger)"
       : tier === "caution"
         ? "var(--warn)"
-        : "var(--good)",
+        : "var(--ok)",
   );
   // At critical, a charging bolt takes priority over the flashing
   // exclamation mark rather than the two competing for attention.
@@ -88,7 +88,7 @@
           <path
             d="M6.6 0.5 1 7h3.6l-1.2 4.5L10 4.5H6.4z"
             fill="var(--batt-color)"
-            stroke="var(--bg-panel)"
+            stroke="var(--surface)"
             stroke-width="3.5"
             stroke-linejoin="round"
             paint-order="stroke fill"

@@ -35,7 +35,7 @@ use crate::pie_menu;
 /// single-machine, single-user bridge between this app and a hook entry it
 /// generates itself, not a general integration point. (`permission_server`
 /// uses the next port up, 47216, for its own separate http endpoint.)
-const PORT: u16 = 47215;
+pub const PORT: u16 = 47215;
 
 #[derive(Deserialize)]
 struct HookPayload {

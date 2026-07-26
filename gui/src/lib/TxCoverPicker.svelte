@@ -1,127 +1,167 @@
 <script>
   import sprite from "../assets/devices/mic-mini-2-cover-cutouts.png";
   import { txCovers, txCover, txCoverPosition } from "./txCovers.js";
+  import Icon from "./ui/Icon.svelte";
+  import Popover from "./ui/Popover.svelte";
 
-  let { value = "obsidian-black", size = 42, onchange } = $props();
+  /**
+   * Which magnetic front cover this transmitter is wearing — cosmetic only
+   * (see covers.svelte.js). Each swatch carries its real name at readable
+   * size; the old picker labelled them at 9px, which is unreadable and below
+   * the type scale's floor.
+   */
+  let { value = "obsidian-black", size = 32, onchange } = $props();
+
+  let open = $state(false);
   const selected = $derived(txCover(value));
 </script>
 
-<details class="picker">
-  <summary aria-label={`更换磁吸前盖，当前${selected.name}`} title={`磁吸前盖：${selected.name}`}>
-    <span
-      class="product"
-      style:width={`${size}px`}
-      style:height={`${size}px`}
-      style:background-image={`url(${sprite})`}
-      style:background-position={txCoverPosition(selected)}
-    ></span>
-    <span class="edit-mark" aria-hidden="true"></span>
-  </summary>
-  <div class="palette">
-    <div class="palette-title">磁吸前盖</div>
-    <div class="swatches">
+<Popover
+  {open}
+  align="end"
+  label="磁吸前盖"
+  onopen={() => (open = true)}
+  onclose={() => (open = false)}
+>
+  {#snippet trigger(toggle, isOpen)}
+    <button
+      class="trigger"
+      onclick={toggle}
+      aria-expanded={isOpen}
+      aria-haspopup="menu"
+      aria-label={`更换磁吸前盖，当前为${selected.name}`}
+      title={`磁吸前盖：${selected.name}`}
+    >
+      <span
+        class="chip"
+        style:width={`${size}px`}
+        style:height={`${size}px`}
+        style:background-image={`url(${sprite})`}
+        style:background-position={txCoverPosition(selected)}
+      ></span>
+      <span class="mark" aria-hidden="true"><Icon name="palette" size="sm" /></span>
+    </button>
+  {/snippet}
+
+  {#snippet children()}
+    <p class="u-label title">磁吸前盖</p>
+    <ul class="swatches" role="menu">
       {#each txCovers as cover (cover.id)}
-        <button
-          class:active={cover.id === selected.id}
-          aria-label={cover.name}
-          title={cover.name}
-          onclick={(event) => {
-            onchange?.(cover.id);
-            event.currentTarget.closest("details").open = false;
-          }}
-        >
-          <span class="swatch" style:background={cover.swatch}></span>
-          <span>{cover.name}</span>
-        </button>
+        <li>
+          <button
+            class="swatch"
+            class:active={cover.id === selected.id}
+            role="menuitemradio"
+            aria-checked={cover.id === selected.id}
+            onclick={() => {
+              onchange?.(cover.id);
+              open = false;
+            }}
+          >
+            <span class="dot" style:background={cover.swatch}></span>
+            <span class="name">{cover.name}</span>
+            {#if cover.id === selected.id}<Icon name="check" size="sm" />{/if}
+          </button>
+        </li>
       {/each}
-    </div>
-  </div>
-</details>
+    </ul>
+  {/snippet}
+</Popover>
 
 <style>
-  .picker {
-    position: relative;
-    flex: 0 0 auto;
-  }
-  summary {
+  .trigger {
     position: relative;
     display: block;
-    list-style: none;
-    border-radius: 8px;
-    cursor: pointer;
-    outline: none;
+    padding: 0;
+    border: none;
+    border-radius: var(--radius-md);
+    background: none;
+    line-height: 0;
+    transition: transform var(--dur-press) var(--ease-out);
   }
-  summary::-webkit-details-marker {
-    display: none;
+  .trigger:active {
+    transform: scale(0.94);
   }
-  summary:focus-visible {
-    box-shadow: 0 0 0 3px var(--accent-soft);
-  }
-  .product {
+
+  .chip {
     display: block;
     background-repeat: no-repeat;
     background-size: 500% 200%;
   }
-  .edit-mark {
+
+  .mark {
     position: absolute;
-    right: -2px;
-    bottom: -2px;
-    width: 12px;
-    height: 12px;
-    border: 2px solid var(--bg-panel);
+    right: -4px;
+    bottom: -4px;
+    display: grid;
+    place-items: center;
+    width: 18px;
+    height: 18px;
+    border: 2px solid var(--surface);
     border-radius: 50%;
     background: var(--accent);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    color: var(--accent-on);
   }
-  .palette {
-    position: absolute;
-    z-index: 120;
-    top: calc(100% + 8px);
-    right: 0;
-    width: 274px;
-    padding: 12px;
-    border: 1px solid color-mix(in srgb, var(--border-strong) 72%, transparent);
-    border-radius: 12px;
-    background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
-    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.2);
-    backdrop-filter: blur(24px) saturate(180%);
+  .mark :global(svg) {
+    width: 10px;
+    height: 10px;
   }
-  .palette-title {
-    margin: 0 2px 9px;
-    font-size: 12px;
-    font-weight: 650;
+
+  .title {
+    padding: var(--space-1) var(--space-2) var(--space-2);
   }
+
   .swatches {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: 7px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-05);
+    margin: 0;
+    padding: 0;
+    list-style: none;
   }
-  button {
-    display: grid;
-    justify-items: center;
-    gap: 4px;
-    min-width: 0;
-    padding: 5px 2px 4px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: transparent;
-    color: var(--text-dim);
-    font-size: 9px;
+
+  .swatch {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    width: 100%;
+    min-height: 32px;
+    padding: var(--space-1) var(--space-2);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+    font-size: var(--type-caption-size);
+    text-align: left;
+    transition: background var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out);
   }
-  button:hover,
-  button.active {
-    border-color: var(--border);
-    background: color-mix(in srgb, var(--bg-elev) 76%, transparent);
+  .swatch:hover {
+    background: var(--surface-sunken);
     color: var(--text);
   }
-  button.active {
-    box-shadow: inset 0 0 0 1px var(--accent);
+  .swatch.active {
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-weight: 600;
   }
-  .swatch {
-    width: 25px;
-    height: 25px;
-    border: 1px solid rgba(0, 0, 0, 0.16);
+
+  /* The ring and its top highlight are what keep a swatch legible whatever
+     color it carries — including the white one — so they relate to the
+     swatch, not to the theme (see app.css). */
+  .dot {
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
     border-radius: 50%;
-    box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.4);
+    box-shadow: var(--swatch-ring-gloss);
+  }
+
+  .name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

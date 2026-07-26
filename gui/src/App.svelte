@@ -1,714 +1,601 @@
 <script>
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import Sidebar from "./lib/Sidebar.svelte";
-  import DevicePanel from "./lib/DevicePanel.svelte";
-  import UdevModal from "./lib/UdevModal.svelte";
-  import ReceiverShortcut from "./lib/ReceiverShortcut.svelte";
-  import {
-    snapshot,
-    setSetting,
-    setTxSetting,
-    udevHelp,
-    installUsbDriver,
-    pairingButtonTestActive,
-    micTapTestStatus,
-  } from "./lib/api.js";
+  import { devices as store, TEMPO } from "./lib/store.svelte.js";
+  import { theme } from "./lib/theme.svelte.js";
+  import { glass } from "./lib/glass.svelte.js";
+  import { APP_SECTIONS, deviceSections } from "./lib/nav.js";
+  import DeviceSwitcher from "./lib/DeviceSwitcher.svelte";
+  import Icon from "./lib/ui/Icon.svelte";
+  import ToastStack from "./lib/ui/ToastStack.svelte";
+  import { toast } from "./lib/ui/toasts.svelte.js";
+  import Overview from "./lib/sections/Overview.svelte";
+  import SettingsGroup from "./lib/sections/SettingsGroup.svelte";
+  import DeviceInfo from "./lib/sections/DeviceInfo.svelte";
+  import InputGestures from "./lib/sections/InputGestures.svelte";
+  import QuickMenu from "./lib/sections/QuickMenu.svelte";
+  import Preferences from "./lib/sections/Preferences.svelte";
 
-  // Custom window chrome. macOS keeps its native traffic lights (via the
-  // Overlay title bar); Windows/Linux use our own frameless controls.
+  // --- Window chrome ----------------------------------------------------
+  // macOS keeps its native traffic lights (overlay title bar); everywhere else
+  // the window is frameless and draws its own controls and resize edges.
   const appWindow = getCurrentWindow();
   const isMac = /Mac/i.test(navigator.userAgent || navigator.platform || "");
   let maximized = $state(false);
-  async function refreshMax() {
-    try {
-      maximized = await appWindow.isMaximized();
-    } catch {
-      /* ignore */
-    }
-  }
-  const minimizeWin = () => appWindow.minimize();
-  const toggleMaxWin = () => appWindow.toggleMaximize();
-  const closeWin = () => appWindow.close();
 
-  // Frameless windows lose the compositor's edge-resize borders, so we add our
-  // own invisible handles (Linux/Windows; macOS keeps its native resize).
   const startResize = (dir) => (e) => {
     if (e.button === 0) appWindow.startResizeDragging(dir);
   };
+  /** Edge class suffix -> the direction name Tauri's resize API expects. */
+  const RESIZE_EDGES = {
+    n: "North", s: "South", e: "East", w: "West",
+    ne: "NorthEast", nw: "NorthWest", se: "SouthEast", sw: "SouthWest",
+  };
 
-  let snap = $state(null);
-  let selected = $state(null);
-  // Distinguishes "nothing selected yet" (auto-select the first device once
-  // one shows up) from "the user deliberately cleared the selection" (leave
-  // it cleared until they pick one again).
-  let userDeselected = $state(false);
+  // --- Navigation -------------------------------------------------------
+  let section = $state("overview");
   let sidebarOpen = $state(true);
-  let pending = $state({});
-  let optimistic = $state({}); // values shown immediately, before the device confirms
-  // Per-TX settings need their own optimistic values because the same setting
-  // can differ between transmitter slots.
-  let pendingTx = $state({});
-  let optimisticTx = $state({});
-  let view = $state("compact");
-  let error = $state(null);
-  let stableStatus = $state(null);
-  let refreshInFlight = false;
-  let workspace = $state("mic");
-  let pairingTestActive = $state(false);
-  let tapStatus = $state({ count: 0, active: false, deviceFound: false });
 
-  let showUdev = $state(false);
-  let help = $state(null);
+  const deviceNav = $derived(deviceSections(store.groups));
+  const nav = $derived([
+    { title: "设备", items: deviceNav },
+    { title: "应用", items: APP_SECTIONS },
+  ]);
+  const flat = $derived(nav.flatMap((g) => g.items));
+  const current = $derived(flat.find((s) => s.id === section) ?? flat[0]);
 
-  const devices = $derived(snap?.devices ?? []);
-  const selectedDevice = $derived(devices.find((d) => d.id === selected) ?? null);
-  const rawStatus = $derived(selectedDevice ? stableStatus ?? snap?.status ?? null : null);
-  // Merge live values with any not-yet-confirmed local changes for instant feedback.
-  const values = $derived.by(() => {
-    const base = { ...(rawStatus?.settings ?? {}) };
-    const txNc = (rawStatus?.tx ?? [])
-      .map((tx, index) => applyOptimisticTx(tx, index))
-      .filter(Boolean)
-      .map((tx) => tx.nc_enabled)
-      .filter((value) => typeof value === "boolean");
-    if (txNc.length > 0) {
-      base["noise-cancel-power"] = txNc.every(Boolean)
-        ? "on"
-        : txNc.every((value) => !value)
-          ? "off"
-          : "mixed";
-    }
-    return { ...base, ...optimistic };
+  // A model can stop declaring a group (unplugged, or a different model
+  // selected) while its section is open. Fall back rather than render nothing.
+  $effect(() => {
+    if (!flat.some((s) => s.id === section)) section = "overview";
   });
-  function txKey(tx, settingId) {
-    return `${tx}:${settingId}`;
-  }
-  function applyOptimisticTx(tx, index) {
-    if (!tx) return tx;
-    const next = { ...tx };
-    const voiceTone = optimisticTx[txKey(index, "voice-tone")];
-    const ncPower = optimisticTx[txKey(index, "noise-cancel-power")];
-    const ncMode = optimisticTx[txKey(index, "noise-cancel")];
-    if (voiceTone !== undefined) next.voice_tone = voiceTone;
-    if (ncPower !== undefined) next.nc_enabled = ncPower === "on";
-    if (ncMode !== undefined) next.nc_mode = ncMode;
-    return next;
-  }
-  const status = $derived(
-    rawStatus && { ...rawStatus, tx: rawStatus.tx.map((tx, i) => applyOptimisticTx(tx, i)) },
-  );
-  // Set on both Linux (missing udev rule) and Windows (missing WinUSB
-  // driver on the receiver's control interface) when a matching device is
-  // on the bus but couldn't be opened.
-  const accessIssue = $derived(snap?.probe?.permission_issue && devices.length === 0);
-  let driverBusy = $state(false);
-  let driverError = $state(null);
 
-  function mergeTx(prev, next) {
-    if (!next) return null;
-    if (!prev) return next;
-    return {
-      ...next,
-      serial: next.serial ?? prev.serial,
-      firmware: next.firmware ?? prev.firmware,
-      product_name: next.product_name ?? prev.product_name,
-      voice_tone: next.voice_tone ?? prev.voice_tone,
-      charging: next.charging ?? prev.charging,
-      battery: next.battery ?? prev.battery,
-      nc_enabled: next.nc_enabled ?? prev.nc_enabled,
-      nc_mode: next.nc_mode ?? prev.nc_mode,
-      low_cut: next.low_cut ?? prev.low_cut,
-      mic_leds: next.mic_leds ?? prev.mic_leds,
-      auto_off: next.auto_off ?? prev.auto_off,
-      nc_button: next.nc_button ?? prev.nc_button,
-    };
+  function go(id) {
+    section = id;
+    // Scroll position is per-section, not shared: arriving at a section
+    // already scrolled halfway down is disorienting.
+    contentEl?.scrollTo({ top: 0 });
   }
 
-  function mergeRx(prev, next) {
-    if (!next) return prev ?? null;
-    if (!prev) return next;
-    return {
-      serial: next.serial ?? prev.serial,
-      firmware: next.firmware ?? prev.firmware,
-    };
-  }
+  // --- The selection marker ---------------------------------------------
+  // One element that slides between nav items rather than a background color
+  // hopping from one button to the next — the same reasoning as Segmented's
+  // indicator, and the thing that makes the two items read as one control.
+  // Measured rather than computed from an index, so it stays correct if a
+  // label ever wraps to two lines or the user scales their system font.
+  let navEl = $state(null);
+  let marker = $state({ y: 0, h: 0 });
+  let markerReady = $state(false);
 
-  function mergeStatus(prev, next) {
-    if (!next) return null;
-    if (!prev || prev.model_id !== next.model_id) return next;
-    const nextSettings = next.settings ?? {};
-    const prevSettings = prev.settings ?? {};
-    return {
-      ...next,
-      nc_enabled:
-        Object.keys(nextSettings).length === 0 && Object.keys(prevSettings).length > 0
-          ? prev.nc_enabled
-          : next.nc_enabled,
-      rx: mergeRx(prev.rx, next.rx),
-      tx: next.tx.map((tx, i) => mergeTx(prev.tx?.[i], tx)),
-      settings:
-        Object.keys(nextSettings).length === 0
-          ? prevSettings
-          : { ...prevSettings, ...nextSettings },
-      protocol_version: next.protocol_version ?? prev.protocol_version,
-      gain_dial: next.gain_dial ?? prev.gain_dial,
-    };
-  }
-
-  async function refresh() {
-    if (refreshInFlight) return;
-    refreshInFlight = true;
-    try {
-      const next = await snapshot(selected);
-      snap = next;
-      // Auto-select once devices show up, unless the user deliberately
-      // cleared the selection (clicking empty space in the sidebar).
-      if (!selected && !userDeselected && next.devices.length > 0) {
-        selected = next.devices[0].id;
-      }
-      // Drop a stale selection.
-      if (selected && !next.devices.some((d) => d.id === selected)) {
-        selected = next.devices[0]?.id ?? null;
-        stableStatus = null;
-      }
-      stableStatus = next.status ? mergeStatus(stableStatus, next.status) : null;
-      // Retire optimistic values the device has now confirmed.
-      const confirmed = next.status?.settings ?? {};
-      let changed = false;
-      const remaining = { ...optimistic };
-      for (const k of Object.keys(remaining)) {
-        const txNc = (next.status?.tx ?? [])
-          .filter(Boolean)
-          .map((tx) => tx.nc_enabled)
-          .filter((value) => typeof value === "boolean");
-        const txNcConfirmed =
-          k === "noise-cancel-power" &&
-          txNc.length > 0 &&
-          txNc.every((value) => value === (remaining[k] === "on"));
-        if (confirmed[k] === remaining[k] && (k !== "noise-cancel-power" || txNc.length === 0 || txNcConfirmed)) {
-          delete remaining[k];
-          changed = true;
-        }
-      }
-      if (changed) optimistic = remaining;
-
-      // Keep each local TX value until that exact slot confirms it. An older
-      // polling response must not make both controls appear synchronized.
-      const confirmedTx = next.status?.tx ?? [];
-      let changedTx = false;
-      const remainingTx = { ...optimisticTx };
-      for (const key of Object.keys(remainingTx)) {
-        const [txText, settingId] = key.split(":");
-        const confirmedTxValue = confirmedTx[Number(txText)];
-        const expected = remainingTx[key];
-        // The receiver mirrors NC power/mode into both TX records, even after
-        // a targeted write. Keep those per-TX values as session truth; only
-        // Voice Tone currently has an independently confirmable return value.
-        const matches = settingId === "voice-tone" && confirmedTxValue?.voice_tone === expected;
-        if (matches) {
-          delete remainingTx[key];
-          changedTx = true;
-        }
-      }
-      if (changedTx) optimisticTx = remainingTx;
-    } catch (e) {
-      error = String(e);
-    } finally {
-      refreshInFlight = false;
+  $effect(() => {
+    // Re-measure whenever the selection or the set of destinations changes.
+    // Runs after Svelte has flushed the DOM, so the active item is already
+    // painted where it will stay.
+    void section;
+    void nav;
+    const el = navEl?.querySelector(".nav-item.active");
+    if (!el) {
+      marker = { y: 0, h: 0 };
+      markerReady = false;
+      return;
     }
-  }
+    marker = { y: el.offsetTop, h: el.offsetHeight };
+    // The first placement must not animate in from the top of the list; every
+    // move after it must. One frame is enough to commit the initial position.
+    if (!markerReady) requestAnimationFrame(() => (markerReady = true));
+  });
 
-  function select(id) {
-    selected = id;
-    userDeselected = id === null;
-    refresh();
-  }
+  // --- Polling ----------------------------------------------------------
+  // The overview shows live level meters and needs the fast poll; nothing
+  // else does. A hidden window (closed to tray) needs no poll at all — the
+  // old build kept hammering the USB bus at 250ms forever after being closed.
+  let visible = $state(!document.hidden);
 
-  async function change(settingId, value) {
-    if (!selected) return;
-    if (settingId === "noise-cancel-power" || settingId === "noise-cancel") {
-      optimisticTx = Object.fromEntries(
-        Object.entries(optimisticTx).filter(([key]) => !key.endsWith(`:${settingId}`)),
-      );
-    }
-    optimistic = { ...optimistic, [settingId]: value }; // reflect the flip instantly
-    pending = { ...pending, [settingId]: true };
-    error = null;
-    try {
-      await setSetting(selected, settingId, value);
-      await refresh();
-    } catch (e) {
-      error = String(e);
-      const { [settingId]: _drop, ...rest } = optimistic;
-      optimistic = rest;
-    } finally {
-      const { [settingId]: _p, ...rest } = pending;
-      pending = rest;
-    }
-  }
+  $effect(() => {
+    const onVis = () => (visible = !document.hidden);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  });
 
-  async function changeTx(tx, settingId, value) {
-    if (!selected) return;
-    const key = txKey(tx, settingId);
-    let nextOptimisticTx = { ...optimisticTx };
-    if (settingId === "noise-cancel-power" || settingId === "noise-cancel") {
-      // Snapshot both visible slots before the targeted write. The next raw
-      // status packet mirrors the changed value to both records and cannot be
-      // used to reconstruct the untouched transmitter.
-      for (const [index, item] of (status?.tx ?? []).entries()) {
-        if (!item) continue;
-        const slotKey = txKey(index, settingId);
-        if (nextOptimisticTx[slotKey] !== undefined) continue;
-        const current =
-          settingId === "noise-cancel-power"
-            ? item.nc_enabled == null
-              ? undefined
-              : item.nc_enabled
-                ? "on"
-                : "off"
-            : item.nc_mode;
-        if (current !== undefined && current !== null) nextOptimisticTx[slotKey] = current;
+  $effect(() => {
+    if (!visible) store.setTempo(TEMPO.off);
+    else store.setTempo(section === "overview" ? TEMPO.live : TEMPO.calm);
+  });
+
+  $effect(() => () => store.stop());
+
+  // A transport-level failure isn't attributable to any one row, so it
+  // surfaces as a toast rather than a banner that reflows the whole page.
+  let lastError = $state(null);
+  $effect(() => {
+    const e = store.error;
+    if (e && e !== lastError) toast.error("无法读取设备状态", { detail: e });
+    lastError = e;
+  });
+
+  // --- Scroll edge ------------------------------------------------------
+  // Apple's rule: a hard divider under floating chrome reads as a seam. The
+  // separation should appear only once content is actually sliding under the
+  // header, so the header publishes its state as an inherited custom property
+  // and SectionHeader consumes it — no prop drilling through three components
+  // for one boolean.
+  let contentEl = $state(null);
+  let scrolled = $state(false);
+
+  // --- Keyboard ---------------------------------------------------------
+  // Ctrl+1..9 jumps to a section, matching how every tabbed desktop app
+  // behaves. Ctrl+B and Ctrl+, are the platform conventions for the sidebar
+  // and preferences.
+  function onKeydown(e) {
+    if (!e.ctrlKey || e.altKey) return;
+    if (e.key >= "1" && e.key <= "9") {
+      const target = flat[Number(e.key) - 1];
+      if (target) {
+        e.preventDefault();
+        go(target.id);
       }
-    }
-    optimisticTx = { ...nextOptimisticTx, [key]: value };
-    pendingTx = { ...pendingTx, [tx]: true };
-    error = null;
-    try {
-      await setTxSetting(selected, tx, settingId, value);
-      await refresh();
-    } catch (e) {
-      error = String(e);
-      const { [key]: _drop, ...rest } = optimisticTx;
-      optimisticTx = rest;
-    } finally {
-      const { [tx]: _p, ...rest } = pendingTx;
-      pendingTx = rest;
-    }
-  }
-
-  async function openUdev() {
-    if (!help) help = await udevHelp();
-    showUdev = true;
-  }
-
-  async function fixDriver() {
-    if (driverBusy) return;
-    driverBusy = true;
-    driverError = null;
-    try {
-      await installUsbDriver();
-      await refresh();
-    } catch (e) {
-      driverError = String(e);
-    } finally {
-      driverBusy = false;
+    } else if (e.key === "b") {
+      e.preventDefault();
+      sidebarOpen = !sidebarOpen;
+    } else if (e.key === ",") {
+      e.preventDefault();
+      go("prefs");
+    } else if (e.key === "r") {
+      e.preventDefault();
+      store.refresh();
     }
   }
 
   $effect(() => {
-    refresh();
-    const timer = setInterval(refresh, 250);
-    return () => clearInterval(timer);
-  });
-
-  // Poll for the pairing-button press indicator and the mic-tap test status
-  // while the shortcut panel is visible (see gui/src-tauri/src/pairing_button.rs
-  // and mic_tap.rs).
-  $effect(() => {
-    if (workspace !== "shortcut") return;
-    let cancelled = false;
-    const tick = async () => {
-      // Independent try/catch per call: one failing (e.g. the mic-tap
-      // audio device not being present yet) must not stop the other from
-      // updating.
+    theme.apply();
+    glass.apply();
+    const sync = async () => {
       try {
-        const active = await pairingButtonTestActive();
-        if (!cancelled) pairingTestActive = active;
+        maximized = await appWindow.isMaximized();
       } catch {
-        // ignore — non-Windows
-      }
-      try {
-        const tap = await micTapTestStatus();
-        if (!cancelled) tapStatus = tap;
-      } catch {
-        // ignore — non-Windows
+        /* not fatal — the icon just keeps its last state */
       }
     };
-    tick();
-    const timer = setInterval(tick, 150);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  });
-
-  // Keep the maximize/restore icon in sync with the window state.
-  $effect(() => {
-    refreshMax();
-    const onResize = () => refreshMax();
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
+    sync();
+    window.addEventListener("resize", sync);
+    return () => window.removeEventListener("resize", sync);
   });
 </script>
 
-<div class="app" class:mac={isMac}>
-  {#if !isMac}
-    <div class="rz rz-n" onmousedown={startResize("North")}></div>
-    <div class="rz rz-s" onmousedown={startResize("South")}></div>
-    <div class="rz rz-e" onmousedown={startResize("East")}></div>
-    <div class="rz rz-w" onmousedown={startResize("West")}></div>
-    <div class="rz rz-ne" onmousedown={startResize("NorthEast")}></div>
-    <div class="rz rz-nw" onmousedown={startResize("NorthWest")}></div>
-    <div class="rz rz-se" onmousedown={startResize("SouthEast")}></div>
-    <div class="rz rz-sw" onmousedown={startResize("SouthWest")}></div>
+<svelte:window onkeydown={onKeydown} />
+
+<div class="app" class:mac={isMac} class:maximized>
+  {#if !isMac && !maximized}
+    {#each Object.entries(RESIZE_EDGES) as [edge, dir] (edge)}
+      <!-- Pointer-only chrome: the OS already offers keyboard window resizing
+           through the system menu, so these are explicitly presentational
+           rather than fake buttons cluttering the tab order. A maximized
+           window has no edges to drag, and leaving them live there would put
+           invisible strips over real controls for no purpose. -->
+      <div class="rz rz-{edge}" role="presentation" onmousedown={startResize(dir)}></div>
+    {/each}
   {/if}
 
-  <div class="topbar" class:mac={isMac} data-tauri-drag-region>
-    <button class="icon-btn" onclick={() => (sidebarOpen = !sidebarOpen)} aria-label="显示或隐藏设备列表">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
-        <path d="M3.5 6h17M3.5 12h17M3.5 18h17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" />
-      </svg>
+  <header class="titlebar" class:mac={isMac} data-tauri-drag-region>
+    <button
+      class="chrome-btn"
+      onclick={() => (sidebarOpen = !sidebarOpen)}
+      aria-label="显示或隐藏侧边栏"
+      aria-pressed={sidebarOpen}
+      title="侧边栏 (Ctrl+B)"
+    >
+      <Icon name="sidebar" size="sm" />
     </button>
-    <div class="workspace-switch" role="tablist" aria-label="工作区">
-      <button class:active={workspace === "mic"} onclick={() => (workspace = "mic")} role="tab" aria-selected={workspace === "mic"}>麦克风</button>
-      <button class:active={workspace === "shortcut"} onclick={() => (workspace = "shortcut")} role="tab" aria-selected={workspace === "shortcut"}>接收器快捷键</button>
-    </div>
-    <span class="brand" data-tauri-drag-region>{workspace === "shortcut" ? "接收器快捷键" : "大疆麦克风控制"}</span>
+
+    <span class="brand" data-tauri-drag-region>
+      <Icon name="mic" size="sm" />
+      <span>大疆麦克风控制</span>
+    </span>
     <div class="drag-fill" data-tauri-drag-region></div>
 
     {#if !isMac}
       <div class="win-controls">
-        <button class="win-btn" onclick={minimizeWin} aria-label="最小化">
-          <svg width="11" height="11" viewBox="0 0 12 12"><path d="M2 6h8" stroke="currentColor" stroke-width="1.2" /></svg>
+        <button class="win-btn" onclick={() => appWindow.minimize()} aria-label="最小化">
+          <Icon name="minimize" size="sm" />
         </button>
-        <button class="win-btn" onclick={toggleMaxWin} aria-label={maximized ? "还原" : "最大化"}>
-          {#if maximized}
-            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1">
-              <rect x="3.2" y="1.6" width="6.2" height="6.2" rx="1" /><rect x="1.6" y="3.6" width="6.2" height="6.8" rx="1" fill="var(--bg-panel)" />
-            </svg>
-          {:else}
-            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.1"><rect x="2" y="2" width="8" height="8" rx="1" /></svg>
-          {/if}
+        <button
+          class="win-btn"
+          onclick={() => appWindow.toggleMaximize()}
+          aria-label={maximized ? "还原" : "最大化"}
+        >
+          <Icon name={maximized ? "restore" : "maximize"} size="sm" />
         </button>
-        <button class="win-btn close" onclick={closeWin} aria-label="关闭">
-          <svg width="11" height="11" viewBox="0 0 12 12"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" /></svg>
+        <button class="win-btn close" onclick={() => appWindow.close()} aria-label="关闭到托盘">
+          <Icon name="x" size="sm" />
         </button>
       </div>
     {/if}
-  </div>
-
-  {#if accessIssue && snap?.os === "linux"}
-    <button class="banner" onclick={openUdev}>
-      已连接麦克风，但当前无权访问。点击修复 USB 权限。
-    </button>
-  {:else if accessIssue && snap?.os === "windows"}
-    <button class="banner" onclick={fixDriver} disabled={driverBusy}>
-      {driverBusy ? "正在下载驱动安装向导，请在权限提示中点击“是”，并在弹出的窗口中选择设备后点击 Install Driver…" : "已连接麦克风，但驱动未安装。点击一键修复（需要管理员权限）。"}
-    </button>
-  {/if}
-
-  {#if driverError}
-    <div class="banner err" role="alert">{driverError}</div>
-  {/if}
-
-  {#if error}
-    <div class="banner err" role="alert">{error}</div>
-  {/if}
+  </header>
 
   <div class="body">
-    <div class="sidebar-wrap" class:open={sidebarOpen && workspace === "mic"}>
-      {#if workspace === "mic"}<Sidebar {devices} {selected} onselect={select} />{/if}
-    </div>
-
-    <main class="main">
-      {#if workspace === "shortcut"}
-        <ReceiverShortcut {pairingTestActive} {tapStatus} />
-      {:else if selectedDevice && status}
-        <DevicePanel
-          device={selectedDevice}
-          {status}
-          settings={snap.settings}
-          {values}
-          {pending}
-          {pendingTx}
-          {view}
-          onchange={change}
-          onchangeTx={changeTx}
-          onview={(v) => (view = v)}
-        />
-      {:else}
-        <div class="placeholder">
-          <div class="ph-card">
-            {#if accessIssue && snap?.os === "linux"}
-              <h2>需要授权</h2>
-              <p>已连接受支持的麦克风，但应用暂无访问权限。</p>
-              <button class="cta" onclick={openUdev}>查看设置步骤</button>
-            {:else if accessIssue && snap?.os === "windows"}
-              <h2>需要安装驱动</h2>
-              <p>
-                已连接受支持的麦克风，但控制接口尚未安装驱动。点击下方按钮会下载官方驱动安装工具
-                Zadig 并以管理员身份启动 —— 在弹出的窗口中从下拉列表选择本设备（型号名中含
-                "Interface 6" 或 "MI_06" 字样），确认驱动类型为 WinUSB，然后点击 Install
-                Driver。安装工具会在成功后自动关闭并被应用删除。
-              </p>
-              <button class="cta" onclick={fixDriver} disabled={driverBusy}>
-                {driverBusy ? "正在下载安装向导…" : "一键修复驱动"}
-              </button>
-            {:else if devices.length > 0}
-              <h2>未选择设备</h2>
-              <p>请从侧边栏选择一个设备。</p>
-            {:else}
-              <h2>未连接麦克风</h2>
-              <p>请通过 USB 连接受支持的大疆麦克风。</p>
-            {/if}
-          </div>
+    <nav class="sidebar" class:open={sidebarOpen} aria-label="主导航">
+      <div class="sidebar-inner">
+        <div class="switcher">
+          <DeviceSwitcher
+            devices={store.devices}
+            selected={store.selected}
+            onselect={(id) => store.select(id)}
+          />
         </div>
-      {/if}
+
+        <div class="groups" bind:this={navEl}>
+          {#if marker.h > 0}
+            <span
+              class="marker"
+              class:ready={markerReady}
+              style:height="{marker.h}px"
+              style:transform="translateY({marker.y}px)"
+              aria-hidden="true"
+            ></span>
+          {/if}
+
+          {#each nav as group (group.title)}
+            <div class="group">
+              <p class="u-label group-title">{group.title}</p>
+              <ul>
+                {#each group.items as item (item.id)}
+                  <li>
+                    <button
+                      class="nav-item"
+                      class:active={section === item.id}
+                      aria-current={section === item.id ? "page" : undefined}
+                      onclick={() => go(item.id)}
+                    >
+                      <Icon name={item.icon} size="sm" />
+                      <span>{item.label}</span>
+                    </button>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/each}
+        </div>
+      </div>
+    </nav>
+
+    <main
+      class="content"
+      class:scrolled
+      bind:this={contentEl}
+      onscroll={(e) => (scrolled = e.currentTarget.scrollTop > 2)}
+    >
+      <!-- Keyed so navigating between two setting groups — which reuse the
+           same component with a different prop — replays the section's entry
+           motion instead of silently swapping its contents. -->
+      {#key current.id}
+        {#if current.id === "overview"}
+          <Overview icon={current.icon} onnavigate={go} />
+        {:else if current.id.startsWith("group:")}
+          <SettingsGroup icon={current.icon} group={current.id.slice(6)} />
+        {:else if current.id === "info"}
+          <DeviceInfo icon={current.icon} />
+        {:else if current.id === "input"}
+          <InputGestures icon={current.icon} active={visible} />
+        {:else if current.id === "pie"}
+          <QuickMenu icon={current.icon} />
+        {:else}
+          <Preferences icon={current.icon} />
+        {/if}
+      {/key}
     </main>
   </div>
 </div>
 
-{#if showUdev && help}
-  <UdevModal {help} onclose={() => (showUdev = false)} />
-{/if}
+<ToastStack />
 
 <style>
   .app {
-    height: 100%;
+    position: relative;
     display: flex;
     flex-direction: column;
-    /* The window is frameless on some platforms (no native border/shadow),
-       so a solid-color desktop behind it can make the edge disappear
-       entirely without this. Not needed on macOS, which already has native
-       decorations (see .mac below). */
-    border: 1px solid var(--border);
+    height: 100%;
   }
-  .app.mac {
-    border: none;
+
+  /* The window's own hairline edge, drawn as a pointer-transparent overlay
+     rather than as a border on .app.
+
+     As a border it inset the entire layout by 1px, which is precisely why the
+     caption buttons could never fill the top-right corner: their hover fill
+     stopped one pixel short of it on two sides. As an overlay the hairline
+     crosses *over* the buttons — exactly what a real Windows frame line does —
+     and the fill runs corner to corner underneath it.
+
+     Frameless windows get no compositor border, so on a dark desktop this is
+     the only thing separating a dark app from it. A maximized window has no
+     outside to be separated from, so it goes away there. */
+  .app::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 400;
+    pointer-events: none;
+    box-shadow: inset 0 0 0 1px var(--border);
   }
-  /* Invisible resize handles pinned to the window edges/corners. */
+  .app.mac::after,
+  .app.maximized::after {
+    content: none;
+  }
+
+  /* Invisible resize handles pinned to the window edges and corners. */
   .rz {
     position: fixed;
-    z-index: 100;
+    z-index: 300;
   }
-  .rz-n {
-    top: 0;
-    left: 8px;
-    right: 8px;
-    height: 5px;
-    cursor: ns-resize;
-  }
-  .rz-s {
-    bottom: 0;
-    left: 8px;
-    right: 8px;
-    height: 5px;
-    cursor: ns-resize;
-  }
-  .rz-e {
-    top: 8px;
-    bottom: 8px;
-    right: 0;
-    width: 5px;
-    cursor: ew-resize;
-  }
-  .rz-w {
-    top: 8px;
-    bottom: 8px;
-    left: 0;
-    width: 5px;
-    cursor: ew-resize;
-  }
-  .rz-ne {
-    top: 0;
-    right: 0;
-    width: 11px;
-    height: 11px;
-    cursor: nesw-resize;
-  }
-  .rz-nw {
-    top: 0;
-    left: 0;
-    width: 11px;
-    height: 11px;
-    cursor: nwse-resize;
-  }
-  .rz-se {
-    bottom: 0;
-    right: 0;
-    width: 11px;
-    height: 11px;
-    cursor: nwse-resize;
-  }
-  .rz-sw {
-    bottom: 0;
-    left: 0;
-    width: 11px;
-    height: 11px;
-    cursor: nesw-resize;
-  }
-  .topbar {
+  .rz-n { top: 0; left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+  .rz-s { bottom: 0; left: 8px; right: 8px; height: 5px; cursor: ns-resize; }
+  .rz-e { top: 8px; bottom: 8px; right: 0; width: 5px; cursor: ew-resize; }
+  .rz-w { top: 8px; bottom: 8px; left: 0; width: 5px; cursor: ew-resize; }
+  .rz-ne { top: 0; right: 0; width: 11px; height: 11px; cursor: nesw-resize; }
+  .rz-nw { top: 0; left: 0; width: 11px; height: 11px; cursor: nwse-resize; }
+  .rz-se { bottom: 0; right: 0; width: 11px; height: 11px; cursor: nwse-resize; }
+  .rz-sw { bottom: 0; left: 0; width: 11px; height: 11px; cursor: nesw-resize; }
+
+  .titlebar {
     position: relative;
+    z-index: 20;
     flex: 0 0 auto;
-    height: 30px;
     display: flex;
     align-items: center;
-    gap: 4px;
-    padding: 0 2px 0 4px;
-    background: var(--bg-panel);
-    border-bottom: 1px solid var(--border);
+    gap: var(--space-1);
+    height: var(--titlebar-h);
+    padding-inline: var(--space-2) 0;
+    background: var(--material-chrome);
+    backdrop-filter: var(--blur-chrome);
+    box-shadow: inset 0 -1px 0 var(--border);
     user-select: none;
   }
-  /* Leave room for the macOS traffic lights (top-left) under the overlay title bar. */
-  .topbar.mac {
+  /* Room for the macOS traffic lights under the overlay title bar. */
+  .titlebar.mac {
     padding-left: 76px;
   }
+
   .drag-fill {
     flex: 1 1 auto;
     align-self: stretch;
   }
-  .icon-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    line-height: 0;
-    border: 1px solid transparent;
-    border-radius: var(--radius-sm);
-    background: transparent;
-    color: var(--text-dim);
-  }
-  .icon-btn:hover {
-    background: var(--bg-elev);
-    color: var(--text);
-  }
-  /* Kill inline-svg baseline gap so icons sit dead-center in their buttons. */
-  .topbar button svg {
-    display: block;
-  }
-  /* Absolutely centered so it stays put regardless of the side controls. */
+
+  /* Absolutely centered so it stays put no matter what flanks it. */
   .brand {
     position: absolute;
     left: 50%;
     top: 50%;
-    transform: translate(-50%, -50%);
-    font-weight: 600;
-    font-size: 13px;
-    letter-spacing: 0.01em;
-    color: var(--text-dim);
-    white-space: nowrap;
-  }
-  .workspace-switch {
     display: flex;
-    overflow: hidden;
-    margin-left: 4px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--bg-elev);
+    align-items: center;
+    gap: var(--space-2);
+    transform: translate(-50%, -50%);
+    font-size: var(--type-caption-size);
+    font-weight: 600;
+    letter-spacing: var(--type-caption-track);
+    color: var(--text-secondary);
+    white-space: nowrap;
+    pointer-events: none;
   }
-  .workspace-switch button {
-    height: 22px;
-    padding: 0 9px;
-    border: 0;
-    border-right: 1px solid var(--border);
-    background: transparent;
-    color: var(--text-dim);
-    font-size: 10px;
+
+  /* The two button clusters sit above the resize handles (z-index 300).
+     Those are fixed-position strips pinned to the window edges, and .rz-n /
+     .rz-ne lay directly over the caption buttons' top edge and the top-right
+     corner: a pointer inside that band never reached the button at all, so the
+     hover fill visibly stopped short of the corner. Windows offers no resize
+     over its caption buttons either, so yielding those pixels of grab area is
+     the native behaviour rather than a compromise. */
+  .chrome-btn,
+  .win-controls {
+    position: relative;
+    z-index: 310;
   }
-  .workspace-switch button:last-child { border-right: 0; }
-  .workspace-switch button.active {
-    background: var(--bg-panel);
+
+  .chrome-btn {
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+    transition: background var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out),
+      transform var(--dur-press) var(--ease-out);
+  }
+  .chrome-btn:hover {
+    background: var(--surface-sunken);
     color: var(--text);
-    font-weight: 650;
   }
+  .chrome-btn:active {
+    transform: scale(0.92);
+  }
+  .chrome-btn[aria-pressed="true"] {
+    color: var(--text);
+  }
+
   .win-controls {
     display: flex;
     align-self: stretch;
-    margin-left: 4px;
   }
   .win-btn {
-    width: 40px;
-    align-self: stretch;
     display: grid;
     place-items: center;
+    width: 46px;
+    align-self: stretch;
     border: none;
-    background: transparent;
-    color: var(--text-dim);
-    transition: background 0.12s, color 0.12s;
+    border-radius: 0;
+    background: none;
+    color: var(--text-secondary);
+    transition: background var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out);
   }
   .win-btn:hover {
-    background: var(--bg-elev);
+    background: var(--surface-sunken);
     color: var(--text);
   }
+  /* No `transform` press feedback here, unlike every other button in the app:
+     scaling a control whose whole job is to fill the window corner would
+     un-fill it on the way down. The darker fill carries the press instead. */
+  .win-btn:active {
+    background: var(--border);
+  }
+  /* The Windows convention: the close button turns red on hover, in both
+     themes, so its glyph is the un-themed white (see app.css) rather than a
+     surface color that would follow the page and lose contrast. */
   .win-btn.close:hover {
-    background: #e5484d;
-    color: #fff;
+    background: var(--danger);
+    color: var(--fixed-white);
   }
-  .banner {
-    flex: 0 0 auto;
-    text-align: left;
-    border: none;
-    padding: 10px 16px;
-    background: color-mix(in srgb, var(--warn) 16%, var(--bg-panel));
-    color: var(--text);
-    border-bottom: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
-    font-size: 13px;
+  .win-btn.close:active {
+    background: color-mix(in srgb, var(--danger) 82%, black);
+    color: var(--fixed-white);
   }
-  .banner.err {
-    background: color-mix(in srgb, var(--danger) 16%, var(--bg-panel));
-    border-bottom-color: color-mix(in srgb, var(--danger) 40%, transparent);
-  }
+
   .body {
     flex: 1 1 auto;
     display: flex;
     min-height: 0;
   }
-  /* Collapsible sidebar: animate width so the panel slides in/out. The inner
-     Sidebar keeps a fixed width and is clipped, giving a smooth slide. */
-  .sidebar-wrap {
+
+  /* Collapsing the sidebar is the one place this app animates a layout
+     property, and it does so knowingly: the content column genuinely has to
+     reflow to reclaim the space, and no transform-only trick avoids that
+     without leaving the content the wrong width at one end of the animation.
+     What *is* avoided is the expensive half — .sidebar-inner keeps its full
+     width and slides, so the panel's own contents never reflow, and the panel
+     reads as sliding out from behind the edge instead of being progressively
+     unmasked in place. */
+  .sidebar {
     flex: 0 0 auto;
-    width: 260px;
-    overflow: hidden;
-    border-right: 1px solid var(--border);
-    transition: width 0.22s ease, border-color 0.22s ease;
-  }
-  .sidebar-wrap:not(.open) {
     width: 0;
-    border-right-color: transparent;
+    overflow: hidden;
+    background: var(--material-sidebar);
+    backdrop-filter: var(--blur-sidebar);
+    /* Inset, so toggling the edge never nudges the layout by a pixel the way
+       a real border did. */
+    box-shadow: inset -1px 0 0 var(--border);
+    will-change: width;
+    transition: width var(--dur-spring) var(--ease-spring);
   }
-  .main {
+  .sidebar.open {
+    width: var(--sidebar-w);
+  }
+
+  .sidebar-inner {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+    width: var(--sidebar-w);
+    height: 100%;
+    padding: var(--space-3) var(--space-3) var(--space-5);
+    overflow-y: auto;
+    transform: translateX(calc(-1 * var(--sidebar-w)));
+    transition: transform var(--dur-spring) var(--ease-spring);
+  }
+  .sidebar.open .sidebar-inner {
+    transform: translateX(0);
+  }
+
+  .switcher {
+    flex: 0 0 auto;
+  }
+
+  .groups {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+  }
+
+  /* The selection, as one object that moves. `.nav-item.active` deliberately
+     carries no background of its own — if it did, two fills would be lit at
+     once for the length of the slide. */
+  .marker {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    pointer-events: none;
+  }
+  .marker.ready {
+    transition: transform var(--dur-spring) var(--ease-spring),
+      height var(--dur-spring) var(--ease-spring);
+  }
+
+  .group-title {
+    padding-inline: var(--space-3);
+    margin-bottom: var(--space-2);
+  }
+
+  .sidebar ul {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-05);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .nav-item {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    width: 100%;
+    min-height: 34px;
+    padding: var(--space-1) var(--space-3);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: var(--text-secondary);
+    font-size: var(--type-caption-size);
+    font-weight: 500;
+    text-align: left;
+    transition: background var(--dur-fast) var(--ease-out),
+      color var(--dur-fast) var(--ease-out),
+      transform var(--dur-press) var(--ease-out);
+  }
+  .nav-item:hover {
+    background: var(--surface-sunken);
+    color: var(--text);
+  }
+  .nav-item:active {
+    transform: scale(0.98);
+  }
+  .nav-item.active,
+  .nav-item.active:hover {
+    background: none;
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .content {
     flex: 1 1 auto;
     min-width: 0;
-    display: flex;
+    overflow-y: auto;
+    background: var(--material-content);
+    /* Sections size themselves against the reading column, not the window.
+       At the 760px minimum width an open sidebar leaves ~520px here, and a
+       viewport media query cannot see that — which is how a setting row with
+       a four-option segmented picker ended up squeezed at exactly the size it
+       was supposed to stack at. */
+    container: content / inline-size;
+    --scroll-edge: 0;
   }
-  .placeholder {
-    flex: 1 1 auto;
-    display: grid;
-    place-items: center;
-    padding: 24px;
+  .content.scrolled {
+    --scroll-edge: 1;
   }
-  .ph-card {
-    text-align: center;
-    max-width: 340px;
-    color: var(--text-dim);
-  }
-  .ph-card h2 {
-    margin: 0 0 8px;
-    color: var(--text);
-    font-size: 18px;
-  }
-  .ph-card p {
-    margin: 0 0 16px;
-    line-height: 1.5;
-  }
-  .cta {
-    border: 1px solid var(--accent);
-    background: var(--accent);
-    color: var(--accent-contrast);
-    padding: 8px 16px;
-    border-radius: var(--radius-sm);
-    font-weight: 600;
+
+  /* Below this width the sidebar would leave the content unusably narrow, so
+     it overlays instead of pushing. */
+  @media (max-width: 720px) {
+    .sidebar.open {
+      position: absolute;
+      top: var(--titlebar-h);
+      bottom: 0;
+      z-index: 15;
+      box-shadow: inset -1px 0 0 var(--border), var(--elev-3);
+    }
   }
 </style>

@@ -29,16 +29,24 @@ export function installUsbDriver() {
   return invoke("install_usb_driver");
 }
 
-export function receiverShortcutStatus() {
-  return invoke("receiver_shortcut_status");
+/**
+ * App-level facts for 偏好设置: version, host OS, autostart state, the pie
+ * menu's global hotkey, and the two loopback ports the Claude Code
+ * integration binds. All read from the backend rather than restated here,
+ * so the settings screen can't describe a state the app isn't in.
+ */
+export function appInfo() {
+  return invoke("app_info");
 }
 
-export function receiverShortcutStart() {
-  return invoke("receiver_shortcut_start");
+/** Turn launch-at-login on or off (mirrors the tray menu's toggle). */
+export function setAutostart(enabled) {
+  return invoke("set_autostart", { enabled });
 }
 
-export function receiverShortcutStop() {
-  return invoke("receiver_shortcut_stop");
+/** The pie menu's six fixed slots, straight from the code that runs them. */
+export function pieMenuSlots() {
+  return invoke("pie_menu_slots");
 }
 
 /** Test-only: whether the pairing button was pressed in the last ~700ms. */
