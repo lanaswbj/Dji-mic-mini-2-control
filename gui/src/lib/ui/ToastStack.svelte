@@ -1,9 +1,31 @@
 <script>
   import { fly } from "svelte/transition";
   import Icon from "./Icon.svelte";
+  import CloseButton from "./CloseButton.svelte";
   import { toasts, dismiss } from "./toasts.svelte.js";
 
   const ICON = { ok: "check", info: "info", warn: "alert", danger: "alert" };
+
+  /**
+   * app.css's `prefers-reduced-motion` block cannot reach the transitions below.
+   * It works by overriding `transition-duration` in CSS, and a Svelte
+   * transition is JS driving inline styles frame by frame — so toasts kept
+   * flying 12px for a user who had asked for no motion. Read once at module
+   * load: this is a display preference, not something that changes mid-session.
+   *
+   * `MOTION` is a factor rather than a branch so both the travel and the
+   * duration collapse together; a 0ms fly that still moves 12px would snap.
+   */
+  const REDUCED = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)");
+  const MOTION = REDUCED?.matches ? 0 : 1;
+  /**
+   * Hand-synced with `--dur-base` / `--dur-fast` in app.css. A JS transition has
+   * no cheap way to read a custom property, so this is the one place in the app
+   * where a duration is duplicated instead of referenced — if those tokens
+   * change, these change with them.
+   */
+  const IN_MS = 240;
+  const OUT_MS = 160;
 </script>
 
 <!-- Fixed and pointer-transparent except on the toasts themselves, so it can
@@ -14,8 +36,8 @@
       class="toast"
       data-tone={t.tone}
       role={t.tone === "danger" ? "alert" : "status"}
-      in:fly={{ y: 12, duration: 240 }}
-      out:fly={{ y: 8, duration: 160 }}
+      in:fly={{ y: 12 * MOTION, duration: IN_MS * MOTION }}
+      out:fly={{ y: 8 * MOTION, duration: OUT_MS * MOTION }}
     >
       <span class="mark"><Icon name={ICON[t.tone] ?? "info"} size="sm" /></span>
       <div class="body">
@@ -27,9 +49,7 @@
           {t.action.label}
         </button>
       {/if}
-      <button class="close" onclick={() => dismiss(t.id)} aria-label="关闭提示">
-        <Icon name="x" size="sm" />
-      </button>
+      <CloseButton label={`关闭提示：${t.title}`} onclick={() => dismiss(t.id)} />
     </div>
   {/each}
 </div>
@@ -64,8 +84,8 @@
   .mark {
     display: grid;
     place-items: center;
-    width: 22px;
-    height: 22px;
+    width: var(--glyph-sm);
+    height: var(--glyph-sm);
     flex: 0 0 auto;
     border-radius: var(--radius-sm);
     color: var(--text-tertiary);
@@ -107,35 +127,26 @@
     overflow-wrap: anywhere;
   }
 
-  .act,
-  .close {
-    flex: 0 0 auto;
-    border: none;
-    background: none;
-    border-radius: var(--radius-sm);
-    transition: background var(--dur-fast) var(--ease-out);
-  }
-
+  /* The dismiss X is `ui/CloseButton.svelte` — it was a local 28px copy that
+     had drifted from the identical one in AccessIssueCard, and 28px was the
+     app's only sub---control-h target. */
   .act {
-    min-height: 28px;
+    flex: 0 0 auto;
+    min-height: var(--control-h);
     padding: 0 var(--space-3);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
     color: var(--accent);
     font-size: var(--type-caption-size);
     font-weight: 600;
+    transition: background var(--dur-fast) var(--ease-out),
+      transform var(--dur-press) var(--ease-out);
   }
   .act:hover {
     background: var(--accent-soft);
   }
-
-  .close {
-    display: grid;
-    place-items: center;
-    width: 28px;
-    height: 28px;
-    color: var(--text-tertiary);
-  }
-  .close:hover {
-    background: var(--surface-sunken);
-    color: var(--text);
+  .act:active {
+    transform: scale(var(--press-scale));
   }
 </style>

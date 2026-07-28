@@ -127,8 +127,8 @@
   .art-empty {
     display: grid;
     place-items: center;
-    width: 48px;
-    height: 48px;
+    width: var(--glyph-xl);
+    height: var(--glyph-xl);
     border-radius: var(--radius-md);
     background: var(--surface-sunken);
     color: var(--text-tertiary);
@@ -140,10 +140,6 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
-  }
-
-  h2 {
-    overflow-wrap: anywhere;
   }
 
   .batt {

@@ -46,19 +46,24 @@
   {#if index >= 0}
     <span
       class="indicator"
-      style:width={`calc((100% - 2 * var(--space-1)) / ${options.length})`}
+      style:width={`calc((100% - 2 * var(--seg-pad)) / ${options.length})`}
       style:transform={`translateX(${index * 100}%)`}
       aria-hidden="true"
     ></span>
   {/if}
-  {#each options as opt (opt.value)}
+  <!-- Roving tabindex: exactly one segment is ever a tab stop, so the group is a
+       single stop and the arrow keys move within it. When nothing is selected
+       (`index < 0` — the normal case for a mixed per-transmitter setting) that
+       stop is the first segment. It used to be *every* segment, which turned one
+       radio group into N separate tab stops. -->
+  {#each options as opt, i (opt.value)}
     <button
       type="button"
       class="segment"
       class:active={value === opt.value}
       role="radio"
       aria-checked={value === opt.value}
-      tabindex={value === opt.value || index < 0 ? 0 : -1}
+      tabindex={index < 0 ? (i === 0 ? 0 : -1) : value === opt.value ? 0 : -1}
       {disabled}
       onclick={() => choose(opt.value)}
       onkeydown={onKeydown}
@@ -74,7 +79,11 @@
     display: inline-grid;
     grid-auto-flow: column;
     grid-auto-columns: 1fr;
-    padding: var(--space-1);
+    /* One source for the track inset. The indicator's offsets and its width
+       calc (set inline in the template) both have to agree with this padding, and
+       they were three copies of `--space-1` held together by hand. */
+    --seg-pad: var(--space-05);
+    padding: var(--seg-pad);
     border-radius: var(--radius-full);
     background: var(--surface-sunken);
     box-shadow: inset 0 0 0 1px var(--border);
@@ -82,9 +91,9 @@
 
   .indicator {
     position: absolute;
-    top: var(--space-1);
-    bottom: var(--space-1);
-    left: var(--space-1);
+    top: var(--seg-pad);
+    bottom: var(--seg-pad);
+    left: var(--seg-pad);
     border-radius: var(--radius-full);
     background: var(--accent);
     box-shadow: var(--elev-1);
@@ -94,7 +103,11 @@
   .segment {
     position: relative;
     z-index: 1;
-    min-height: 26px;
+    /* --control-h, matching Button and Switch — this is the primary enum
+       control on every settings screen and it was the one sitting at a 26px hit
+       target. The track's own inset shrank to --space-05 to pay for it, so the
+       group is 36px overall rather than 40. */
+    min-height: var(--control-h);
     padding: var(--space-1) var(--space-4);
     border: none;
     border-radius: var(--radius-full);
@@ -112,7 +125,7 @@
   }
 
   .segment:not(:disabled):active {
-    transform: scale(0.97);
+    transform: scale(var(--press-scale));
     transition: transform var(--dur-press) var(--ease-out);
   }
 
@@ -121,7 +134,7 @@
   }
 
   .disabled {
-    opacity: 0.45;
+    opacity: var(--disabled-opacity);
   }
   .disabled .segment {
     cursor: default;

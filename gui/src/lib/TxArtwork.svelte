@@ -2,7 +2,16 @@
   import sprite from "../assets/devices/mic-mini-2-cover-cutouts.png";
   import { txCover, txCoverPosition } from "./txCovers.js";
 
-  let { value = "obsidian-black", size = 124 } = $props();
+  /**
+   * The transmitter wearing a specific magnetic front cover, cut from one
+   * sprite sheet.
+   *
+   * `size` defaults to what the only caller actually asks for (TxCard's 72). It
+   * used to default to 124 — a number no call site passes and no layout
+   * contains, so the component advertised a size it had never once been
+   * rendered at.
+   */
+  let { value = "obsidian-black", size = 72 } = $props();
   const selected = $derived(txCover(value));
 </script>
 

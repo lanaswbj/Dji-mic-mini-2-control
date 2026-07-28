@@ -75,13 +75,30 @@
 >
   {#snippet control(descId)}
     {#if unknown}
-      <span class="unknown" title="设备尚未上报这一项">—</span>
+      <!-- Words, not an em dash with the words hidden in a `title`. A tooltip on
+           a non-interactive span is unreachable by keyboard, never shows on
+           touch, and leaves a screen reader announcing a bare punctuation mark —
+           so the one row on screen that needed explaining was the one that
+           explained itself least. It costs about the width of the switch it
+           stands in for. -->
+      <span class="unknown">尚未上报</span>
     {:else if setting.kind === "toggle"}
+      <!-- `disabled={locked}` only, deliberately *not* `|| state === "writing"`.
+           A write flips `state` synchronously, so disabling on it destroyed the
+           keyboard focus standing on this very control every single time
+           (details in store.svelte.js's `change`). Repeat input during a write
+           is dropped by the store instead. The row still shows the write in
+           flight — `Row`'s `.write-state` is an aria-live region, so the
+           feedback is not lost either.
+           `describedBy` only when there *is* a description: `Row` renders its
+           <p id={descId}> conditionally, so passing the id unconditionally
+           pointed aria-describedby at an element that does not exist — the case
+           for every transmitter-card switch, which supplies no description. -->
       <Switch
         {checked}
-        disabled={locked || state === "writing"}
+        disabled={locked}
         label={setting.label}
-        describedBy={descId}
+        describedBy={hint ? descId : undefined}
         onchange={(on) =>
           onchange?.(setting.id, setting.options[on ? 1 : 0].value)}
       />
@@ -90,7 +107,7 @@
         options={setting.options}
         value={mixed ? null : value}
         {mixed}
-        disabled={locked || state === "writing"}
+        disabled={locked}
         label={setting.label}
         onchange={(v) => onchange?.(setting.id, v)}
       />
@@ -100,8 +117,9 @@
 
 <style>
   .unknown {
-    padding: 0 var(--space-3);
+    padding: 0 var(--space-2);
     color: var(--text-tertiary);
-    font-variant-numeric: tabular-nums;
+    font-size: var(--type-caption-size);
+    white-space: nowrap;
   }
 </style>

@@ -18,8 +18,8 @@
      The three surfaces that also exist as a *material* (see below) are stored
      as bare `R G B` channel triples, so the exact same color can be used
      opaque and translucent without one of the two copies drifting from the
-     other — which is what happened when --material-sidebar was a literal
-     rgba() that no longer matched --canvas. */
+     other — which is what happened when the panel materials were literal
+     rgba()s that no longer matched --canvas. */
   --canvas-rgb: 242 243 245;
   --surface-rgb: 255 255 255;
   --raised-rgb: 255 255 255;
@@ -37,6 +37,13 @@
   /* --- Accent ---------------------------------------------------------- */
   --accent: #1f6feb;
   --accent-on: #ffffff; /* 4.64:1 on --accent */
+  /* Text on a filled --danger surface (the danger Button's hover state). Its
+     own token rather than borrowing --accent-on, and definitely rather than the
+     `var(--surface)` it used to be: a *background* token standing in for a
+     foreground happened to work only because --surface and --danger invert
+     together between the themes, so the pairing that had to be checked for
+     contrast was invisible. 6.1:1 on --danger. */
+  --danger-on: #ffffff;
   --accent-soft: rgb(31 111 235 / 0.1);
 
   /* --- Status ---------------------------------------------------------- */
@@ -48,32 +55,112 @@
   --danger-soft: rgb(192 38 38 / 0.12);
 
   /* --- Materials -------------------------------------------------------
-     Translucent layers that content scrolls *under* (Apple: chrome is a
-     floating material, not an opaque strip). Never stack two of these.
+     Translucent layers over the window's own backdrop.
 
-     The window itself is transparent and carries a Mica backdrop (see
-     tauri.conf.json), so these alphas are what actually lets the desktop
-     through. Material weight encodes hierarchy, exactly as Apple describes
-     it: the sidebar is the thinnest (it is structure, it should recede), the
-     content plane is the thickest (it is where reading happens), chrome sits
-     between them. Cards stay fully opaque on purpose — a translucent card on
-     a translucent content plane is the one stack the rule forbids.
+     Read this before changing an alpha, because the first version of this
+     block shipped a glass effect that was, fully working and correctly
+     wired, *invisible*:
+
+     1. The backdrop is Windows 11 **Acrylic**, not Mica. Mica samples only
+        the desktop wallpaper, heavily blurred and pulled toward the system
+        base color — it deliberately shows nothing of the windows behind, and
+        over an ordinary wallpaper its whole contribution is a faint tint.
+        Acrylic (DWMSBT_TRANSIENTWINDOW) blurs what is actually behind the
+        window, which is the thing people mean by "glass".
+     2. The alphas were 0.86/0.66. Nothing survives that. They now sit in the
+        0.3-0.6 band, where a material still reads as one surface.
+     3. Cards were opaque, and cards cover most of the content area — so even
+        a perfect backdrop only showed in the gaps between them. The cards
+        are now *the* glass layer, and the plane beneath them was thinned to
+        compensate: two translucent layers are allowed only when their
+        combined weight still lands a legible surface under the text, which
+        is what --glass-content x --glass-card is tuned for.
+
+     The other half of the same trap: `backdrop-filter` cannot see the OS
+     backdrop. It samples what the *page* painted beneath the element, so it
+     belongs only where in-page content actually scrolls under something —
+     the section header, the dock, popovers, toasts, dialogs. On the title bar
+     and the old sidebar it spent GPU time blurring nothing at all.
+
+     The title bar is not on this list at all any more: it is opaque
+     --surface (App.svelte), by request. It is the one surface in the app
+     whose job is to *not* be translucent, so it takes no alpha token and
+     ignores the 外观 → 窗口毛玻璃 switch.
 
      Each alpha is its own token so `--translucent="off"` (偏好设置 → 外观, and
-     the two a11y media queries below) can flatten all four to 1 in one place
+     the two a11y media queries below) can flatten them all in one place
      instead of every component knowing about the preference. */
-  --glass-chrome: 0.66;
-  --glass-sidebar: 0.56;
-  --glass-content: 0.86;
-  --glass-popover: 0.86;
+  --glass-chrome: 0.55;
+  /* The plane is the app's *only* glass layer, and it is deliberately thin.
+
+     The previous arrangement — plane 0.48 under cards 0.62 — put every line of
+     body text on the sum of two translucent layers (~0.80 effective). That
+     reads as a washed-out panel rather than as a material, and it inverted the
+     platform convention: on both Windows 11 and macOS the *chrome* is the
+     material and the *content* is opaque, where this had the one opaque
+     surface (the title bar) framing see-through content. It also meant the only
+     place the backdrop appeared at full strength was the 8px --panel-gap
+     gutter — i.e. the strongest glass in the app was a border.
+
+     Cards are opaque now (--glass-card below), so nothing constrains this alpha
+     for legibility any more: no body text sits directly on the plane
+     (SectionHeader carries its own --material-chrome). That frees it to go
+     *down* rather than up, which is what makes the plane read as one continuous
+     material instead of a tint, and shrinks the step between the gutter and the
+     plane so the gutter stops looking like a cut-out.
+
+     The resulting ladder is monotonic in exactly one direction:
+     gutter (undiluted acrylic) -> plane (0.30) -> card (opaque). */
+  --glass-content: 0.3;
+  /* Opaque. Cards carry the readable surface and float on the plane via
+     --elev-2 + --border, so text contrast is an exact, theme-independent number
+     rather than the product of two alphas over an unknown wallpaper. Kept as a
+     token rather than deleting --material-card, so the material stays
+     flattenable from one place and a later design can reopen it. */
+  --glass-card: 1;
+  --glass-popover: 0.8;
 
   --material-chrome: rgb(var(--surface-rgb) / var(--glass-chrome));
-  --material-sidebar: rgb(var(--canvas-rgb) / var(--glass-sidebar));
   --material-content: rgb(var(--canvas-rgb) / var(--glass-content));
+  --material-card: rgb(var(--surface-rgb) / var(--glass-card));
   --material-popover: rgb(var(--raised-rgb) / var(--glass-popover));
   --blur-chrome: blur(20px) saturate(180%);
-  --blur-sidebar: blur(24px) saturate(140%);
   --blur-popover: blur(28px) saturate(180%);
+  /* The modal scrim's blur. Far weaker than the two above and deliberately so:
+     it blurs the *app*, not a material, and its job is to say "this is out of
+     reach" without hiding the context the dialog is asking about. It is a token
+     for the same reason the others are — it has to switch off with them. It was
+     a literal `blur(2px)` written twice (Dialog, AccessIssueCard), so a user
+     with reduced transparency on still got a blurred backdrop from the one place
+     the flattening blocks could not reach. */
+  --blur-scrim: blur(2px);
+
+  /* What the unpainted --panel-gap gutter actually shows.
+     `transparent` is only correct while something is meant to show *through* the
+     window. The moment translucency is off — the 外观 switch, or either a11y
+     setting — `transparent: true` in tauri.conf.json means that strip is not
+     "the window's material", it is a hole straight through to the desktop, and
+     the app reads as a screenshot with its edges cut out. (The Acrylic backdrop
+     itself is never removed any more; this token is what actually covers it.
+     See lib/glass.svelte.js.) Flattening the --glass-* alphas does not reach it, because the gutter
+     paints no material at all: it is `body`. So the gutter needs its own token,
+     flipped in the same three places as the alphas. --surface-sunken rather than
+     --canvas so the content plane still reads as a panel floating on something,
+     opaque or not — the layout should not change shape when the glass goes. */
+  --window-bg: transparent;
+
+  /* Light catching the top edge of a surface — what separates a material from a
+     flat rectangle, and something no alpha can express. Flattened to nothing
+     when glass is off.
+
+     There used to be a companion `--glass-gloss` here (a short highlight falling
+     down the top face). It went with the translucent card: a gloss is what keeps
+     a *see-through* rectangle from reading as a washed-out panel, and on the
+     opaque card surface it was just a white streak. Once the card stopped using
+     it nothing did, and a token defined in six places and read in none is
+     exactly the drift this file exists to prevent — the same reason
+     `--material-sidebar` left with the sidebar. */
+  --glass-sheen: inset 0 1px 0 rgb(255 255 255 / 0.7);
 
   /* --- Elevation -------------------------------------------------------
      Bigger surfaces read as thicker: deeper shadow the higher the layer. */
@@ -92,7 +179,17 @@
      sits on the same red fill either way, and a hairline around a color chip
      has to relate to that chip's own color rather than to the page's. They
      are still tokens so the exceptions stay enumerable here instead of
-     hiding as literals in five component style blocks. */
+     hiding as literals in five component style blocks.
+
+     Two sets of literal colors live outside this file and cannot come here,
+     because they are not *this app's* colors at all — they are copies of
+     something else's, and a token would let the copy drift from its original
+     while still looking correct:
+       - lib/sections/Preferences.svelte's TRAY_LEGEND — the exact pixels
+         src-tauri/src/main.rs paints into the tray badge.
+       - lib/txCovers.js's `swatch` values — the physical magnetic covers DJI
+         sells for the transmitter.
+     Anything else hardcoding a color is drift, not an exception. */
   --fixed-white: #ffffff;
   --knob-shadow: 0 1px 2px rgb(0 0 0 / 0.28);
   --swatch-ring: inset 0 0 0 1px rgb(0 0 0 / 0.2);
@@ -130,6 +227,56 @@
   --icon-sm: 16px;
   --icon-md: 20px;
   --icon-lg: 24px;
+
+  /* --- Glyph plates -----------------------------------------------------
+     The rounded square an icon sits in to name a thing: a card's subject, a
+     row's setting, a toast's tone, a section's destination. Six different
+     hand-picked sizes had accumulated for one pattern (22/28/28/28/34/40/48),
+     with `--glyph: 28px` declared locally and identically in two components.
+     Four steps, tied to the type scale they sit beside, is the whole range this
+     app actually needs. */
+  --glyph-sm: 22px;
+  --glyph-md: 28px;
+  --glyph-lg: 34px;
+  --glyph-xl: 48px;
+
+  /* --- Control & target sizing ------------------------------------------
+     Two heights, and the difference between them is what the thing is for.
+     --control-h is anything you *set a value with* — Button, Segmented,
+     Switch, a swatch row: dense enough to stack several in a card.
+     --hit is chrome you *aim at* rather than read — a dock item, a live probe,
+     a picto plate — where the target size is the whole point.
+
+     Tokens rather than literals because one of them is load-bearing in a place
+     nothing pointed at: `--dock-clear` (App.svelte) is how far the last card
+     scrolls clear of the floating dock, and it was a hand-summed `100px`
+     derived from the dock item's 44px. Changing the dock's size silently left
+     the last card half covered — the same class of bug Section.svelte's own
+     note records having already been fixed once. --dock-clear is now computed
+     from this token, so the two cannot disagree. */
+  --control-h: 32px;
+  --hit: 44px;
+
+  /* --- Press & disabled -------------------------------------------------
+     `--dur-press` was tokenised long ago; the travel it drives was not, and six
+     different scales had drifted in (0.92 / 0.94 / 0.97 / 0.99, plus one that
+     scaled *up*). Two are enough, and the split is about target size rather
+     than taste: a large square can take a deep press without looking broken, a
+     small or wide control cannot.
+     Exception worth keeping literal: `.win-btn` has no press transform at all,
+     because scaling a control whose job is to fill the window corner would
+     un-fill it on the way down. */
+  --press-scale: 0.97;
+  --press-scale-lg: 0.92;
+  /* A control that spans most of its container presses *less*, not more: the
+     same 3% on a 260px-wide trigger throws its edges 4px and reads as the
+     layout twitching rather than as a button going down. */
+  --press-scale-wide: 0.99;
+  /* Disabled controls are exempt from WCAG's contrast minimum, so this is a
+     usability number rather than a compliance one — but it was applied as a bare
+     `opacity: 0.45` in three components and `prefers-contrast: more` could not
+     reach it. As a token it can be, and is (see that block below). */
+  --disabled-opacity: 0.45;
 
   /* --- Motion ----------------------------------------------------------
      --ease-spring is a real critically-damped spring (damping 1.0,
@@ -186,8 +333,24 @@
 
   /* --- Layout ---------------------------------------------------------- */
   --titlebar-h: 44px;
-  --sidebar-w: 232px;
+  /* The window's own corner radius — Windows 11's standard 8px for a normal
+     top-level window. It is a *token* because two entirely separate things have
+     to agree on it or the top-right corner visibly comes apart: DWM clips the
+     composited window to this radius (set explicitly in main.rs rather than
+     inherited, so the shape is known), and .app::after paints the frame
+     hairline that has to follow the same arc. When the hairline was square it
+     cut diagonally across the corner instead of hugging it, which is what made
+     the close button's red hover fill look like it stopped short of the edge. */
+  --window-radius: 8px;
+  /* The gutter between the window frame and the floating content plane. It is
+     the only place the backdrop is guaranteed to be visible undiluted, since no
+     card can reach it — see the materials note above. */
+  --panel-gap: 8px;
   --measure: 72ch;
+  /* The reading column. Owned here rather than by Section, because the
+     sticky header has to align to the very same column and the two sat in
+     different files with only a copied number holding them together. */
+  --measure-wide: 980px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -214,13 +377,20 @@
     --warn: #e8b055;
     --warn-soft: rgb(232 176 85 / 0.16);
     --danger: #f2777a;
+    /* Near-black for the same reason --accent-on is: the dark theme's danger is
+       a light salmon, and white on it is 1.9:1. */
+    --danger-on: #0e1014;
     --danger-soft: rgb(242 119 122 / 0.16);
 
-    /* Dark Mica is much darker than light Mica, so the same alpha reads as
-       more transparent; the content plane is nudged up to keep body text on
-       a stable ground. The materials themselves are derived from the channel
-       tokens above and need no restating. */
-    --glass-content: 0.88;
+    /* Dark acrylic is much darker than light acrylic, so the same alpha reads
+       as more transparent — the plane needs a slightly thicker wash than the
+       light theme's 0.30 to still read as a surface rather than as a hole. It
+       is the only alpha restated here: --glass-card is opaque in both themes,
+       and the materials derive from the channel tokens above. A white sheen at
+       0.7 would be a glowing wire on a dark card — light catches a dark edge
+       far more faintly, and the gloss falls off with it. */
+    --glass-content: 0.34;
+    --glass-sheen: inset 0 1px 0 rgb(255 255 255 / 0.09);
 
     /* Pure-black shadows are invisible on a dark canvas, so depth comes from
        a top light-catch edge instead (Apple: light catching the material). */
@@ -259,9 +429,11 @@
   --warn: #e8b055;
   --warn-soft: rgb(232 176 85 / 0.16);
   --danger: #f2777a;
+  --danger-on: #0e1014;
   --danger-soft: rgb(242 119 122 / 0.16);
 
-  --glass-content: 0.88;
+  --glass-content: 0.34;
+  --glass-sheen: inset 0 1px 0 rgb(255 255 255 / 0.09);
 
   --elev-1: 0 1px 2px rgb(0 0 0 / 0.4), 0 2px 8px -4px rgb(0 0 0 / 0.5);
   --elev-2: 0 1px 2px rgb(0 0 0 / 0.45), 0 8px 20px -8px rgb(0 0 0 / 0.6);
@@ -305,39 +477,51 @@
    the theme ones on specificity, so source order is what makes them win. */
 :root[data-translucent="off"] {
   --glass-chrome: 1;
-  --glass-sidebar: 1;
   --glass-content: 1;
+  --glass-card: 1;
   --glass-popover: 1;
   --blur-chrome: none;
-  --blur-sidebar: none;
   --blur-popover: none;
+  --blur-scrim: none;
+  --glass-sheen: inset 0 0 0 0 transparent;
+  --window-bg: var(--surface-sunken);
 }
 
 @media (prefers-reduced-transparency: reduce) {
   :root {
     --glass-chrome: 1;
-    --glass-sidebar: 1;
     --glass-content: 1;
+    --glass-card: 1;
     --glass-popover: 1;
     --blur-chrome: none;
-    --blur-sidebar: none;
     --blur-popover: none;
+    --blur-scrim: none;
+    --glass-sheen: inset 0 0 0 0 transparent;
+    --window-bg: var(--surface-sunken);
   }
 }
 
 @media (prefers-contrast: more) {
   :root {
     --glass-chrome: 1;
-    --glass-sidebar: 1;
     --glass-content: 1;
+    --glass-card: 1;
     --glass-popover: 1;
     --blur-chrome: none;
-    --blur-sidebar: none;
     --blur-popover: none;
+    --blur-scrim: none;
+    --glass-sheen: inset 0 0 0 0 transparent;
+    --window-bg: var(--surface-sunken);
     --border: var(--text-secondary);
     --border-strong: var(--text);
     --text-secondary: var(--text);
     --text-tertiary: var(--text);
+    /* The one thing this block used to miss. Disabled controls were dimmed by a
+       hardcoded `opacity: 0.45` inside three components, which no amount of
+       token hardening here could touch — so a user asking for more contrast got
+       every border and label strengthened except the controls that were already
+       hardest to read. 0.7 still reads as unmistakably inactive. */
+    --disabled-opacity: 0.7;
   }
 }
 
@@ -347,32 +531,74 @@
   box-sizing: border-box;
 }
 
+/* `clip`, not `hidden` — this is load-bearing, not a style choice.
+   `overflow: hidden` still makes an element a *scroll container*; it only
+   removes the scrollbar. So a document that "cannot scroll" could still be
+   scrolled programmatically — by focusing something out of view, by
+   `scrollIntoView`, or by a wheel event landing on chrome that is not itself a
+   scroller — and the moment anything overflowed the viewport (an absolutely
+   positioned Popover panel hanging out of the title bar was the real case),
+   `body.scrollTop` moved. Every such scroll translated `.app`, sliding the
+   opaque title bar up out of view and leaving a band of bare window where its
+   white used to be: "the title bar is missing a chunk".
+   `overflow: clip` is not a scroll container at all, so there is nothing left
+   to scroll and the class of bug is closed rather than mitigated. */
 html,
 body,
 #app {
   height: 100%;
   margin: 0;
+  overflow: clip;
 }
 
-/* Transparent, not --canvas: the window carries a Mica backdrop and the app
-   shell paints every pixel of it itself (chrome / sidebar / content plane),
-   each at its own material weight. An opaque body would sit under all three
-   and cancel the effect. */
+/* No elastic overscroll anywhere by default.
+   Chromium ships elastic overscroll on Windows, and it applied to *both*
+   axes of every scroll container in this app — including the horizontal one
+   nobody asked for: `overflow-y: auto` with `overflow-x: visible` computes
+   overflow-x to `auto`, so the content plane was horizontally overscrollable
+   even though it has nothing to scroll to. Dragging diagonally on a
+   precision touchpad slid the whole screen sideways and sprang back.
+   Containers that want a bounce opt back in deliberately (lib/fluidScroll.js
+   implements one that is axis-locked and follows Apple's own damping). */
+html,
+body {
+  overscroll-behavior: none;
+}
+
+/* --window-bg, not a literal: while the Acrylic backdrop is live this must be
+   `transparent` so the gutter around the floating content plane (App.svelte)
+   shows it directly, and any opaque body would sit under the effect and cancel
+   it. With the backdrop gone, the identical rule turns the gutter into a hole
+   through to the desktop — so the value is a token that flips with the glass.
+   See its definition above. The title bar is unconditionally opaque and paints
+   its own --surface rather than relying on either state. */
 body {
   font-family: var(--font-ui);
   font-size: var(--type-body-size);
   line-height: var(--type-body-line);
-  background: transparent;
+  background: var(--window-bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  overflow: hidden;
+  /* No `overflow` here on purpose: it is set to `clip` above, and a later
+     `hidden` would win on source order and quietly restore the scroll
+     container that rule exists to remove. */
 }
 
 button {
   font: inherit;
   color: inherit;
   cursor: pointer;
+}
+
+/* Paths, commands and identifiers offer the browser no break opportunity — a
+   backslash is not one — so a Windows path inside a paragraph runs straight past
+   the edge of a container that is `overflow-x: hidden`. That is how the message
+   telling the user "请先手动修好这个文件" managed to clip the filename it was
+   naming. Global rather than per-component: every `<code>` in this app holds a
+   path, a port or a command, and none of them may be the thing that overflows. */
+code {
+  overflow-wrap: anywhere;
 }
 
 button:disabled {
@@ -402,13 +628,59 @@ h3 {
   line-height: var(--type-title-sm-line);
   letter-spacing: var(--type-title-sm-track);
   font-weight: 620;
+  /* Card titles carry device-supplied strings — model names, transmitter labels
+     — and a card can be as narrow as ~420px in 概览's two-column grid. Owned
+     here for the same reason the sizes are: TxCard had grown a local copy of
+     exactly this rule, which is the tell that every *other* card was going
+     without it. */
+  overflow-wrap: anywhere;
 }
 
-/* One focus ring for the whole app. Never removed — only replaced. */
+/* Every modal surface, from one place. The app has two `<dialog>`s — the shared
+   confirmation `ui/Dialog.svelte` and AccessIssueCard's udev-instructions panel
+   — and they had each written their own backdrop and their own entrance. Which
+   is how they came to disagree: one materialized, the other appeared instantly,
+   so the same gesture produced two different-feeling modals depending on which
+   screen you were on. The panel geometry (width, padding, radius) stays local
+   because it genuinely differs; arrival and scrim do not.
+
+   `[open]` rather than a class: `showModal()` sets it, and a closed `<dialog>`
+   is `display: none`, so this is the exact moment the surface becomes visible. */
+dialog::backdrop {
+  background: var(--scrim);
+  backdrop-filter: var(--blur-scrim);
+}
+
+/* Materialize rather than plain-fade: blur and scale move together so the
+   surface reads as arriving, not as opacity being turned up. */
+dialog[open] {
+  animation: dialog-in var(--dur-base) var(--ease-out);
+}
+@keyframes dialog-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(8px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  dialog[open] {
+    animation: none;
+  }
+}
+
+/* One focus ring for the whole app. Never removed — only replaced.
+
+   Deliberately *no* `border-radius` here. It used to set --radius-sm, which
+   applies to the element rather than to the outline: focusing a Button snapped
+   its filled background from 10px to 6px, every pill-shaped control
+   (.segment, .switch, the dock items — all --radius-full) became a 6px
+   rectangle, and .win-btn (radius 0, whose whole job is to fill the window
+   corner) rounded away from that corner. An outline already follows the
+   element's own border-radius, so the declaration bought nothing and cost a
+   shape jump on every keyboard focus. */
 :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
-  border-radius: var(--radius-sm);
 }
 
 ::selection {

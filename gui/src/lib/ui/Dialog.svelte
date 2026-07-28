@@ -27,6 +27,13 @@
 
   let el = $state(null);
 
+  // A `<dialog>` derives no accessible name from its contents, so without these
+  // it announces as a bare "dialog" — on the one surface in the app whose whole
+  // job is to make sure the user knows what they are about to agree to.
+  const id = $props.id();
+  const titleId = `${id}-title`;
+  const descId = `${id}-desc`;
+
   $effect(() => {
     if (!el) return;
     if (open && !el.open) el.showModal();
@@ -34,12 +41,18 @@
   });
 </script>
 
-<dialog bind:this={el} class="dialog" oncancel={(e) => { e.preventDefault(); oncancel?.(); }}>
+<dialog
+  bind:this={el}
+  class="dialog"
+  aria-labelledby={titleId}
+  aria-describedby={description ? descId : undefined}
+  oncancel={(e) => { e.preventDefault(); oncancel?.(); }}
+>
   <div class="head">
     <span class="mark" data-tone={tone}><Icon name={icon} size="md" /></span>
     <div class="titles">
-      <h2>{title}</h2>
-      {#if description}<p class="u-caption">{description}</p>{/if}
+      <h2 id={titleId}>{title}</h2>
+      {#if description}<p class="u-caption" id={descId}>{description}</p>{/if}
     </div>
   </div>
   <div class="actions">
@@ -61,22 +74,9 @@
     box-shadow: var(--elev-4), var(--edge-highlight);
   }
 
-  .dialog::backdrop {
-    background: var(--scrim);
-    backdrop-filter: blur(2px);
-  }
-
-  /* Materialize rather than plain-fade: blur and scale move together so the
-     surface reads as arriving, not as opacity being turned up. */
-  .dialog[open] {
-    animation: dialog-in var(--dur-base) var(--ease-out);
-  }
-  @keyframes dialog-in {
-    from {
-      opacity: 0;
-      transform: scale(0.96) translateY(8px);
-    }
-  }
+  /* The scrim and the entrance animation live in app.css, on `dialog` itself.
+     They were written identically here and in AccessIssueCard's hand-rolled
+     panel, which is how the two modals drifted into arriving differently. */
 
   .head {
     display: flex;
@@ -87,8 +87,8 @@
   .mark {
     display: grid;
     place-items: center;
-    width: 40px;
-    height: 40px;
+    width: var(--glyph-xl);
+    height: var(--glyph-xl);
     flex: 0 0 auto;
     border-radius: var(--radius-md);
     background: var(--surface-sunken);
@@ -114,11 +114,5 @@
     display: flex;
     justify-content: flex-end;
     gap: var(--space-2);
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .dialog[open] {
-      animation: none;
-    }
   }
 </style>

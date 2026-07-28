@@ -58,7 +58,7 @@
     align-items: center;
     justify-content: center;
     gap: var(--space-2);
-    min-height: 32px;
+    min-height: var(--control-h);
     padding: var(--space-2) var(--space-4);
     border: 1px solid transparent;
     border-radius: var(--radius-md);
@@ -73,11 +73,11 @@
 
   /* Press feedback fires on pointer-down and never changes layout bounds. */
   .btn:not(:disabled):active {
-    transform: scale(0.97);
+    transform: scale(var(--press-scale));
   }
 
   .btn:disabled {
-    opacity: 0.45;
+    opacity: var(--disabled-opacity);
   }
 
   [data-variant="primary"] {
@@ -112,10 +112,13 @@
     border-color: color-mix(in srgb, var(--danger) 40%, transparent);
     color: var(--danger);
   }
+  /* --danger-on, not --surface. A background token standing in for a foreground
+     only ever worked because the two invert together between the themes, which
+     hid the one pairing here that has to be contrast-checked. */
   [data-variant="danger"]:not(:disabled):hover {
     background: var(--danger);
     border-color: var(--danger);
-    color: var(--surface);
+    color: var(--danger-on);
   }
 
   .body {

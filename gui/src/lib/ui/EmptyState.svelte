@@ -10,7 +10,11 @@
 
 <div class="empty">
   <span class="mark"><Icon name={icon} size="lg" /></span>
-  <h3>{title}</h3>
+  <!-- `h2`, not `h3`. Every empty state in the app sits inside a *titleless*
+       Card, so there is no card-level h2 above it — an h3 here jumped the
+       outline straight from the section's h1. Visually identical: app.css
+       styles h2 and h3 with the same step. -->
+  <h2>{title}</h2>
   {#if description}<p class="u-caption">{description}</p>{/if}
   {#if action}<div class="action">{@render action()}</div>{/if}
 </div>
@@ -28,8 +32,8 @@
   .mark {
     display: grid;
     place-items: center;
-    width: 48px;
-    height: 48px;
+    width: var(--glyph-xl);
+    height: var(--glyph-xl);
     border-radius: var(--radius-lg);
     background: var(--surface-sunken);
     color: var(--text-tertiary);

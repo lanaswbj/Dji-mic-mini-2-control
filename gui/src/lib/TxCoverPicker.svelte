@@ -28,7 +28,7 @@
       class="trigger"
       onclick={toggle}
       aria-expanded={isOpen}
-      aria-haspopup="menu"
+      aria-haspopup="dialog"
       aria-label={`更换磁吸前盖，当前为${selected.name}`}
       title={`磁吸前盖：${selected.name}`}
     >
@@ -45,14 +45,16 @@
 
   {#snippet children()}
     <p class="u-label title">磁吸前盖</p>
-    <ul class="swatches" role="menu">
+    <!-- Plain buttons, not a `role="menu"` — same reasoning as DeviceSwitcher's
+         list: the menu roles promised a keyboard model that was never
+         implemented. -->
+    <ul class="swatches">
       {#each txCovers as cover (cover.id)}
         <li>
           <button
             class="swatch"
             class:active={cover.id === selected.id}
-            role="menuitemradio"
-            aria-checked={cover.id === selected.id}
+            aria-current={cover.id === selected.id ? "true" : undefined}
             onclick={() => {
               onchange?.(cover.id);
               open = false;
@@ -80,7 +82,7 @@
     transition: transform var(--dur-press) var(--ease-out);
   }
   .trigger:active {
-    transform: scale(0.94);
+    transform: scale(var(--press-scale-lg));
   }
 
   .chip {
@@ -89,22 +91,24 @@
     background-size: 500% 200%;
   }
 
+  /* The plate is --glyph-sm rather than the 18px it used to be, and that is the
+     whole fix: at 18px the icon inside had to be forced down to 10px through a
+     `:global(svg)` override, which was the app's *fourth* icon size — the one
+     thing Icon.svelte's doc comment says is a design-system violation rather
+     than a prop. --glyph-sm less the 2px ring leaves exactly enough room for a
+     real --icon-sm glyph, so the override is gone instead of tokenised. */
   .mark {
     position: absolute;
     right: -4px;
     bottom: -4px;
     display: grid;
     place-items: center;
-    width: 18px;
-    height: 18px;
+    width: var(--glyph-sm);
+    height: var(--glyph-sm);
     border: 2px solid var(--surface);
     border-radius: 50%;
     background: var(--accent);
     color: var(--accent-on);
-  }
-  .mark :global(svg) {
-    width: 10px;
-    height: 10px;
   }
 
   .title {
@@ -125,7 +129,7 @@
     align-items: center;
     gap: var(--space-2);
     width: 100%;
-    min-height: 32px;
+    min-height: var(--control-h);
     padding: var(--space-1) var(--space-2);
     border: none;
     border-radius: var(--radius-sm);

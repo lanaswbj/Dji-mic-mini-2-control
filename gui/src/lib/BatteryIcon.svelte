@@ -60,10 +60,19 @@
 </script>
 
 {#if tier}
+  <!-- `role="img"` + `aria-label`, not just `title`.
+       `title` on a generic <span> is not exposed as an accessible name, so the
+       whole battery reading — which `label` above computes in four tiers — was
+       reaching nobody: the svg is aria-hidden and the only visible text beside
+       it is the static word 电量 (TxCard) or TX1 (DeviceSwitcher). It also left
+       tier carried by colour and fill width alone, and 电量很低 vs 即将关机
+       share both. `title` stays, for the sighted mouse user. -->
   <span
     class="batt"
     class:flash={showExclaim}
     style="--batt-color:{color}"
+    role="img"
+    aria-label="电池：{label}{charging ? '（充电中）' : ''}"
     title="电池：{label}{charging ? '（充电中）' : ''}"
   >
     <svg width={size} height={size * 0.55} viewBox="0 0 22 12" fill="none" aria-hidden="true">

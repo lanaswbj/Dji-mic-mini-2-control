@@ -18,8 +18,20 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
-    max-width: 980px;
-    padding: var(--space-2) var(--space-8) var(--space-12);
+    /* Centred, not left-hugged. Left-aligned this was merely off at the
+       default window size and glaring the moment the sidebar collapsed: the
+       column stayed pinned left while ~350px of empty plane opened on the
+       right. The width is a token because the sticky header has to land on
+       the exact same column, and the two lived in different files held
+       together by a copied number. */
+    width: 100%;
+    max-width: var(--measure-wide);
+    margin-inline: auto;
+    /* The bottom step is the dock's clearance, not a design value: the
+       navigation floats *over* this column (App.svelte), so the last card has
+       to be able to scroll clear of it or it is permanently half-covered. The
+       fallback keeps this component usable in a layout that has no dock. */
+    padding: var(--space-2) var(--space-8) var(--dock-clear, var(--space-12));
     /* Content arrives; chrome stays put. The header is deliberately excluded —
        animating the sticky element too would make the whole screen blink on
        every navigation, where moving only what actually changed reads as one

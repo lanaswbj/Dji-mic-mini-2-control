@@ -19,14 +19,20 @@
 </script>
 
 <header class="section-head">
-  {#if icon}
-    <span class="glyph"><Icon name={icon} size="md" /></span>
-  {/if}
-  <div class="titles">
-    <h1>{title}</h1>
-    {#if subtitle}<p class="u-caption">{subtitle}</p>{/if}
+  <!-- The material runs the full width of the plane; the *content* is held to
+       the same measured column as the cards below it, so the title sits over
+       the first card rather than drifting left of it once the sidebar is
+       collapsed and the plane is 350px wider. -->
+  <div class="head-inner">
+    {#if icon}
+      <span class="glyph"><Icon name={icon} size="md" /></span>
+    {/if}
+    <div class="titles">
+      <h1>{title}</h1>
+      {#if subtitle}<p class="u-caption">{subtitle}</p>{/if}
+    </div>
+    {#if actions}<div class="actions">{@render actions()}</div>{/if}
   </div>
-  {#if actions}<div class="actions">{@render actions()}</div>{/if}
 </header>
 
 <style>
@@ -34,12 +40,28 @@
     position: sticky;
     top: 0;
     z-index: 10;
+    background: var(--material-chrome);
+    /* The one place a backdrop-filter earns its cost: real content scrolls
+       under this one. */
+    backdrop-filter: var(--blur-chrome);
+    box-shadow: var(--glass-sheen);
+    /* No `transform` here. This used to carry `translateY(var(--bounce))` to
+       cancel `fluidScroll`'s rubber band — the band translated the whole scroll
+       container, header included, so pulling past the top slid the screen's own
+       title down and opened an empty band above it. The band is gone (see
+       lib/fluidScroll.js for why), so the counter-transform has nothing left to
+       cancel, and leaving it would keep a `transform` on a `position: sticky`
+       element for no reason at all. */
+  }
+
+  .head-inner {
     display: flex;
     align-items: flex-end;
     gap: var(--space-3);
+    width: 100%;
+    max-width: var(--measure-wide);
+    margin-inline: auto;
     padding: var(--space-6) var(--space-8) var(--space-4);
-    background: var(--material-chrome);
-    backdrop-filter: var(--blur-chrome);
   }
 
   /* The scroll-edge fade: a short gradient hanging off the bottom of the
@@ -65,7 +87,7 @@
      up by half the difference between its box and the h1's line box, so its
      centre lands on the centre of the title. */
   .glyph {
-    --glyph: 34px;
+    --glyph: var(--glyph-lg);
     display: grid;
     place-items: center;
     width: var(--glyph);
@@ -104,7 +126,7 @@
   }
 
   @container content (max-width: 860px) {
-    .section-head {
+    .head-inner {
       padding-inline: var(--space-5);
     }
   }

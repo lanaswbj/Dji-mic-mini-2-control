@@ -5,13 +5,24 @@
    * word. `text` is therefore required, not optional; pass `compact` to
    * render it visually hidden (still read by screen readers) when the
    * surrounding layout already states it.
+   *
+   * `compact` used to break that rule on the one screen it exists for. Hiding
+   * the word leaves a *sighted* user with nothing but hue, and its only use is
+   * the title bar, where 已连接 (green) and 连接中 (amber) are the whole
+   * message. So a compact dot is shape-coded too: a settled state is a solid
+   * disc, an unsettled one a hollow ring — legible with no color vision at all,
+   * and it happens to read correctly as "not there yet".
    */
   import Icon from "./Icon.svelte";
 
   let { tone = "neutral", text, compact = false, pulse = false } = $props();
+
+  // Solid = this is the state now; ring = on the way to one. `neutral` is the
+  // absence of a state rather than a settled one, so it rings as well.
+  const settled = $derived(tone === "ok" || tone === "danger");
 </script>
 
-<span class="status" data-tone={tone}>
+<span class="status" class:open={compact && !settled} data-tone={tone}>
   <span class="dot" class:pulse aria-hidden="true"></span>
   {#if tone === "danger"}<Icon name="alert" size="sm" />{/if}
   <span class:u-sr-only={compact}>{text}</span>
@@ -67,6 +78,15 @@
   [data-tone="accent"] .dot {
     background: var(--accent);
     box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  /* The second channel for a dot with its word hidden. `currentColor` picks up
+     whichever tone rule matched above, so this needs no per-tone repetition —
+     and the ring is thick enough (2 of the dot's 4px radius) to survive at the
+     size the title bar renders it. */
+  .open .dot {
+    background: transparent;
+    box-shadow: inset 0 0 0 2px currentColor;
   }
 
   /* Used for live detection indicators (a tap was just heard). Deliberately

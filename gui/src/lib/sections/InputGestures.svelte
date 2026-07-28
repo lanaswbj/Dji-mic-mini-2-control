@@ -122,7 +122,11 @@
     <p class="u-caption u-measure">
       快捷菜单打开时，它用来确认当前选中的项；语音输入进行中时，它用来结束这次输入。
     </p>
-    <div class="probe" class:hot={pairing}>
+    <!-- A live region, because this probe's whole job is to answer "did the app
+         see that?" and it answers by changing a colour and a few characters.
+         The text only changes on a real press, so it announces once per press
+         rather than at the 150ms poll rate. -->
+    <div class="probe" class:hot={pairing} aria-live="polite">
       <StatusDot
         tone={pairing ? "ok" : "neutral"}
         text={pairing ? "检测到按下" : "等待按下配对键…"}
@@ -148,6 +152,14 @@
         </div>
       {/each}
     </div>
+    <!-- The two probes above cannot carry this themselves: their text is a fixed
+         "1 下" / "2 下" and only the *tone* changes, so a live region on either
+         would have nothing new to announce. One region that names what was just
+         heard is the only way this screen reports a tap without being looked
+         at — and reporting the tap is the entire point of the screen. -->
+    <p class="u-sr-only" aria-live="polite">
+      {tap.active ? `检测到 ${tap.count} 下敲击` : ""}
+    </p>
     <p class="u-caption u-measure">连敲 3 下及以上会按 2 下处理。说话时的爆破音会被语音检测挡掉，不会误触发。</p>
   </Card>
 
@@ -250,9 +262,14 @@
     background: var(--ok-soft);
   }
 
+  /* `auto-fit`, not a hard `repeat(2, …)`. Each cell holds a 44px-tall probe
+     whose StatusDot text is `white-space: nowrap`, so two forced columns only
+     survived because the labels happen to be two characters ("1 下" / "2 下").
+     A minimum column width lets the pair drop to one column in a narrow card
+     instead of crushing. */
   .taps {
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
     gap: var(--space-3);
   }
 

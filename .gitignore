@@ -20,6 +20,10 @@ native/**/build/
 
 # Logs
 *.log
+# Git Bash crash dumps — they land in whatever directory a `bash.exe` happened
+# to die in. See the root CLAUDE.md on running MSVC builds through PowerShell
+# rather than Git Bash.
+*.stackdump
 
 # Editor / IDE
 .idea/

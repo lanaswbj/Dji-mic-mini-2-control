@@ -44,7 +44,7 @@
 </button>
 
 <style>
-  /* The button is the hit target (>=32px tall); the track inside is the
+  /* The button is the hit target (--control-h tall); the track inside is the
      visual. Padding, not size, is what makes a small control reachable. */
   .switch {
     display: grid;
@@ -53,7 +53,7 @@
     border: none;
     background: none;
     border-radius: var(--radius-full);
-    min-height: 32px;
+    min-height: var(--control-h);
   }
 
   .track {
@@ -100,7 +100,11 @@
 
   /* Feedback on press, not on release. */
   .switch:not(:disabled):active .knob {
-    transform: scale(0.92) translateX(var(--knob-x, 0));
+    /* --press-scale-lg, and `--knob-x` below is pre-divided by that same number
+       so the scaled translate still lands the knob on its resting position. The
+       two are coupled: changing the token without redoing --knob-x makes the
+       knob drift sideways on press. */
+    transform: scale(var(--press-scale-lg)) translateX(var(--knob-x, 0));
     transition: transform var(--dur-press) var(--ease-out);
   }
   .switch.on:not(:disabled):active .knob {
@@ -111,6 +115,6 @@
   }
 
   .switch:disabled {
-    opacity: 0.45;
+    opacity: var(--disabled-opacity);
   }
 </style>

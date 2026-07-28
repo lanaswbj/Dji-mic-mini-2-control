@@ -153,6 +153,18 @@ Windows-only concerns get their own modules:
     `{cwd}/.claude/settings.local.json`'s `permissions.allow` array — the same file/format Claude
     Code's own `destination: "localSettings"` suggestions target. Best-effort: a failed
     read/merge/write still lets the already-decided allow proceed, just without being remembered.
+- **`claude_hooks.rs`** — writes the two hooks above into the *user-level* `~/.claude/settings.json`,
+  which is what turns them from two open sockets into a working feature. (Not to be confused with
+  `permission_server`'s own writes, which target the *project-level*
+  `{cwd}/.claude/settings.local.json`; different file, different purpose.) Three rules it exists to
+  enforce, all of them load-bearing because the file is not ours and routinely carries other tools'
+  hooks: **never clobber** (parsed as a generic `Value` and mutated in place, anything unrecognised
+  copied through), **be idempotent** — entries are recognised by the *port number* in the
+  command/url rather than by a marker field, precisely so a hand-written registration (which is what
+  every existing user has) is adopted instead of duplicated — and **be reversible** (the first write
+  leaves a `.djimic-backup` beside the file; uninstall removes exactly what install added and cleans
+  up emptied groups). A `settings.json` that exists but does not parse as an object is the one state
+  it refuses to touch at all.
 
 ## Frontend (`src`)
 
@@ -164,25 +176,174 @@ shown. `main.js` mounts one of two root components depending on `getCurrentWindo
 `invoke()` wrapper layer; add new Tauri commands there rather than calling `invoke` directly from a
 component. All copy is Simplified Chinese.
 
-The main window is a **sidebar-navigated, section-based app**, not a tabbed one. See
+The main window is a **section-based app navigated from a floating dock**, not a tabbed one. See
 `design-system/dji-mic-control/MASTER.md` for the design system that `app.css` and `lib/ui/`
 implement, including a table mapping each of its sections to the code implementing it.
 
-The window is **transparent with a Windows 11 Mica backdrop** (`transparent: true` +
-`windowEffects` in `tauri.conf.json`), so `body` is `background: transparent` and the shell paints
-every pixel itself at three material weights — sidebar thinnest, content plane thickest. Two
-consequences worth knowing before touching a background anywhere: an opaque surface anywhere in that
-chain cancels the effect, and cards stay opaque *on purpose* (a translucent card over the
-translucent content plane is the one stack Apple's material rule forbids). `lib/glass.svelte.js`
-owns the on/off preference and must always move both halves together — the `data-translucent`
-attribute that flattens the `--glass-*` alphas, **and** Tauri's `setEffects`/`clearEffects`; either
-one alone is visibly wrong (Mica nobody can see, or an unblurred see-through window).
+The window is **transparent with a Windows 11 Acrylic backdrop** (`transparent: true` +
+`windowEffects` in `tauri.conf.json`), so `body` is `background: transparent`. Four things about it
+have each already cost a real defect — the full reasoning is §2.4 of the design system, this is the
+short form:
+
+- **Acrylic, not Mica.** Mica samples only the wallpaper and deliberately shows nothing of the
+  windows behind, so at any legible alpha it is invisible. Don't "restore" it.
+- **The gutter is unpainted — but only while there is a backdrop to show.** The `--panel-gap` strip
+  around the floating content plane is the only region no card can cover, and therefore the only place
+  the material is unambiguously visible; painting it kills the effect at the one spot there is nothing
+  else to look at. **The moment the effect is off it stops being a material and becomes a hole**: the
+  window is `transparent: true`, so with the backdrop gone that strip shows the desktop straight
+  through and the app reads as a screenshot with its edges cut out. Flattening the `--glass-*` alphas
+  does not reach it, because the gutter paints no material at all — it is `body`. Hence
+  **`--window-bg`**, flipped in the same three places as the alphas (`data-translucent="off"`,
+  `prefers-reduced-transparency`, `prefers-contrast`). Anything else that relies on the window being
+  see-through needs the same treatment; "glass off" means three signals, not one.
+- **The title bar is not part of that.** It is opaque `--surface` (pure white in the light theme),
+  by request, and ignores the 外观 → 窗口毛玻璃 switch. It used to be unpainted like the gutter and
+  read as a *hole*: a band of desktop above the app with the app's own name floating in it and no
+  surface under the buttons. It is the one surface whose job is to not be translucent, so it takes no
+  `--glass-*` alpha at all.
+- **The content plane is the only glass layer; cards are opaque.** Three arrangements have shipped
+  and the distinction between them is the whole point — do not collapse them:
+  1. Opaque cards over a **thick** plane (0.48). Cards cover nearly the whole content area, so the
+     backdrop only showed in the gaps between them: translucent on paper, invisible in fact.
+  2. Translucent cards (0.62) over that same plane. Body text then sat on the sum of two alphas
+     (~0.80 effective), which reads as a washed-out panel rather than a material — and it inverted
+     the platform convention, leaving the content see-through and the chrome solid.
+  3. **Current:** opaque cards (`--glass-card: 1`) over a **thin** plane (`--glass-content` 0.30
+     light / 0.34 dark). Nothing has to be legible on the plane any more — no body text sits
+     directly on it, `SectionHeader` carries its own `--material-chrome` — so the alpha went *down*
+     rather than up. The material is now continuous across the whole content area instead of
+     surviving only in card gaps, card text contrast is an exact theme-independent number again, and
+     the step from the gutter to the plane is small enough that the gutter stops reading as a
+     cut-out. The ladder is monotonic in one direction: gutter (undiluted acrylic) → plane → card.
+  Cards also drop `--glass-gloss` (a gloss keeps a *translucent* rectangle from reading flat; on an
+  opaque surface it is a white streak) but keep `--glass-sheen`, which is legitimate elevation
+  either way. And **no `backdrop-filter` on the plane** — see the point below: nothing is painted
+  beneath it for one to sample, so it would be pure GPU cost.
+- **`backdrop-filter` cannot see the OS backdrop.** It samples what the *page* painted below the
+  element, so it belongs only where in-page content genuinely scrolls under something: the section
+  header, **the dock**, popovers, toasts, dialogs. On the title bar and the old sidebar it blurred an
+  empty rectangle. The dock is the clearest legitimate case in the app: the content plane genuinely
+  scrolls underneath it.
+
+`lib/glass.svelte.js` owns the on/off preference, and it is now **pure CSS** — it calls no Tauri API
+at all. The backdrop is applied once by `windowEffects` in `tauri.conf.json`, at window creation, and
+is never removed; "off" makes the page opaque instead, which hides it exactly as completely.
+
+That is a deliberate retreat from an IPC design that broke twice, in opposite directions:
+
+- **Turning it back on did not visibly work.** `setEffects` writes
+  `DWMWA_SYSTEMBACKDROP_TYPE` correctly, but DWM will not recompose an *already visible* window's
+  frame just because that attribute changed — the glass only appeared after the user minimised and
+  restored the window (or resized it). Removing the toggle's OS call removed that path entirely.
+- **Before that, every call was being refused** for a missing permission, and the code treated *any*
+  rejection as "the backdrop is gone" and flattened the CSS — switching off a correctly configured,
+  actively rendering Acrylic from the frontend and making it read as "the glass was never
+  implemented".
+
+**The same DWM quirk bites at startup, and that half lives in `main.rs::reveal_backdrop`.** The
+window is created with `"visible": false` and revealed later (so autostart comes straight up into the
+tray), so the backdrop attribute lands on a window DWM has never composed — and *every launch* came
+up opaque until the user minimised and restored it. `reveal_backdrop` re-applies the effect and then
+forces the recalculation with `SetWindowPos(…, SWP_FRAMECHANGED | NOMOVE | NOSIZE | NOZORDER |
+NOACTIVATE)`, on the two paths that reveal the window (startup, and `show_main` from the tray). It
+does both because "attribute ignored on a hidden window" and "attribute stored but never composed"
+are indistinguishable from that side. **Anything that makes this window visible needs it** — a new
+reveal path that skips it will reintroduce the exact same bug report.
+
+Two facts from that era are still worth not rediscovering: `core:default` grants **read-only** window
+getters, so any mutation (`set_effects`, `minimize`, `start_dragging`, …) needs its own explicit
+entry; and there is **no** `core:window:allow-clear-effects` — `clearEffects()` is not a second
+command, it invokes the same `plugin:window|set_effects` with `value: null`. Inventing the symmetric
+name fails the *build* with `Permission … not found`, because capability names are validated at
+compile time by the build script. Which is also why **`npm run build` can never verify a change under
+`src-tauri/`, `capabilities/` included** — use `cargo check -p djimic-gui`.
 
 - **`lib/nav.js`** — the navigation model. Two tiers: **设备** (概览 → one section per protocol setting
   *group* → 设备信息) and **应用** (敲击与按键 / 快捷菜单 / 偏好设置). The middle of the 设备 tier is
   data-driven from `Setting.group`, so a new model declaring a new group gets a section without anyone
-  editing the frontend. `Ctrl+1..9` jumps to a section, `Ctrl+B` toggles the sidebar, `Ctrl+,` opens
-  preferences, `Ctrl+R` forces a refresh.
+  editing the frontend. The two tiers are flattened into one list for the dock; `Ctrl+1..9` jumps to a
+  section, `Ctrl+,` opens preferences, `Ctrl+R` forces a refresh. (`Ctrl+B` is gone with the sidebar.)
+- **`App.svelte`'s shell** — an opaque title bar, one full-width content plane inset by `--panel-gap`,
+  and the navigation floating over it as `lib/Dock.svelte`. The 236px sidebar this replaced was
+  spending a fixed quarter of the window on seven labels that never change, and forced every section
+  to lay itself out against a column whose width depended on a toggle. The receiver picker moved into
+  the title bar (`DeviceSwitcher compact`): a scope selector belongs in chrome, and that is the only
+  chrome left.
+- **`lib/Dock.svelte`** — uniform 44px squares, labels in tooltips, one measured pill that slides
+  between them. **Deliberately not reorderable.** The first version shipped drag-to-reorder here and
+  it was the wrong control for it: every press on a nav item then has to be disambiguated from the
+  start of a drag, a tax paid on every click to buy a rearrangement nobody performs twice. Reordering
+  lives on the pie menu's slots instead (`lib/pieOrder.svelte.js`), where the order genuinely decides
+  how far the selection has to travel. `Section.svelte`'s bottom padding is `--dock-clear` (set on
+  `.content`) so the last card can scroll clear of the dock rather than sitting permanently half
+  covered.
+- **The flex-`gap` trap**, kept because it is invisible in the markup and cost a "the whole thing
+  looks subtly crooked" bug report on the old rail: **a flex `gap` survives a zero-width child.**
+  Sending a label to `width: 0` leaves the item's 12px gap in place, so what gets centred is
+  glyph-plus-gap and every icon sits exactly half a gap — 6px — left of true centre, uniformly.
+  Anything that centres by removing siblings must zero the `gap` and the inline padding too.
+- **`lib/fluidScroll.js`** — the Svelte action on `.content` supplying a rubber band at each end
+  (Chromium's own elastic overscroll is off via `overscroll-behavior: none`). **There is no gesture
+  phase and no release phase**, and every version that had them was wrong. Chromium runs its own fling
+  animation for a precision touchpad, so wheel events keep arriving for up to a second after the
+  fingers have left the pad — a design that waits for silence before springing waits out the whole
+  fling, and the fling's tail is uneven, so every gap longer than the grace window started the spring
+  and every event after it cancelled and re-extended it. Two or three of those in a row is precisely
+  the reported "卡一下、又卡两下、然后才弹回来", and no grace-window value fixes it, because the
+  silence it waits for never arrives while the user is still watching. The spring now integrates
+  toward zero on *every* frame and a wheel event only displaces it: sustained pushing reaches an
+  equilibrium (the band sits out under pressure, which is what it should look like), and the instant
+  the input weakens the spring is already winning. Consequences worth not undoing — no velocity is
+  estimated from event timestamps (there is no handoff to seam, and those estimates were themselves a
+  jitter source: an event 4ms after its predecessor implies ten times the real velocity); resistance
+  is applied on *intake*, so the stored excursion is the painted excursion and the spring's numbers
+  mean what they say; and there is still no axis latch, since `overflow-x: hidden` already makes the
+  container unable to move sideways and the old JS latch swallowed whole gestures when a flick began
+  with a few px of drift. **It is now the container's only wheel owner** — every same-axis event is
+  `preventDefault`ed, not just the ones pushing against an end stop, because the mid-range is where
+  Chromium's own eased wheel animation lives and that easing is the "acceleration" the module exists
+  to remove. So it drives `scrollTop` for the whole range, at a **constant px/s** toward a `target`
+  a wheel event merely displaces: displacement over time is a straight line, no ease in or out.
+  `speed` is recomputed **only when input arrives**, never per frame — per-frame recomputation from
+  the remaining distance *is* exponential decay, i.e. exactly the easing being removed. A precision
+  touchpad still coasts, and cannot be stopped from coasting: Windows' driver keeps sending real
+  wheel events for up to a second after the fingers leave the pad, and they are applied 1:1.
+  Two consequences of owning both jobs in one module: a band may only *start* once the target is
+  pinned at an end **and** the viewport has caught up to it (otherwise a fast flick bounces while
+  still coasting toward the bottom — an excursion nowhere near an end, swallowing every event
+  after it), and `adopt()` has to notice scroll positions the module did not set, since `go()` runs
+  `scrollTo({top: 0})` on every navigation and the arrow keys scroll natively.
+  **The excursion is also published as `--bounce` on the
+  container, and `SectionHeader` cancels it with an equal `translateY`.** Translating the scroll
+  container translates everything in it, sticky header included — so pulling past the top slid the
+  screen's own title down and opened an empty band above it, which reads as the whole page having
+  come loose rather than as content hitting its end. Pinning the chrome and letting only the cards
+  travel under it is what the header is built for and what the same gesture does on iOS. An inherited
+  custom property rather than a prop: the header is three components down, and re-rendering it 60
+  times a second to move it is the wrong mechanism when the compositor can do it with no JS at all.
+  **The invariant that matters most: an excursion may only exist at a real end stop.** Every wheel
+  event is `preventDefault`ed while one is live, so a band that survives into the middle of the range
+  presents as "the page won't scroll and something is bouncing around" — the worst failure this
+  module has, and the one that was actually shipped. Two things guard it now. A reversal that
+  cancels the excursion **must zero the spring's velocity too**: the spring is normally pulling
+  *inward* when the user reverses, so zeroing the position alone launched the band straight out the
+  opposite side, self-sustaining and nowhere near an end. And `tick` re-checks `anchored()` every
+  frame and drops anything that no longer holds, because plenty of ordinary things strand a band —
+  navigating a section runs `scrollTo({top: 0})`, and 概览's live meters change the content height
+  four times a second.
+- **`lib/pieOrder.svelte.js`** — the pie menu's slot order, the one list in the app that is
+  user-rearrangeable (edited from 快捷菜单 in the main window, never on the overlay itself). Entries
+  are **stable slot indices** — `pie_menu.rs`'s `SLOTS[i].index`, which is what `pie_menu_select`'s
+  `match` is written against — so reordering never changes what a slot does, and `PieMenu.svelte`
+  maps the picked screen position back through the order before invoking. The backend has no notion
+  of order at all. Two invariants are enforced on every read, and a stored value violating either is
+  discarded whole rather than repaired: the **close slot stays last** (`PieMenu.svelte` recognises
+  close as `ITEMS.length - 1`, and a question overlay reuses the same convention), and the value must
+  be a **full permutation** (a short one would silently hide an action). It lives in localStorage
+  rather than in the backend because the overlay and the main window are two WebViews of one origin
+  and share it; the overlay calls `refresh()` on each `pie-menu:open`, which is the only moment the
+  order can matter.
 - **`lib/store.svelte.js`** — the single owner of device state (`devices`, a rune-based class): the
   snapshot poll, the v2 carry-forward merge (`mergeStatus`/`mergeTx`/`mergeRx`), optimistic writes, and
   `lockReason`. Four behaviors matter, each fixing a real defect in the pre-redesign build:
@@ -208,11 +369,32 @@ one alone is visibly wrong (Mica nobody can see, or an unblurred see-through win
     context takes its own line, which is what put 概览's「全部音频设置」chevron on a second row. A
     trailing glyph on a `Button` goes through `iconEnd`, never into `children`.
   - Responsive rules are **container queries** against `.content` (`@container content (…)`), not
-    viewport media queries. At the 760px minimum window width an open sidebar leaves the reading
-    column ~520px wide, and `@media (max-width: 640px)` cannot see that — which is exactly how
-    `Row`'s stacking breakpoint failed to fire at the size it existed for.
+    viewport media queries. The reading column is never the window width — it is capped at
+    `--measure-wide` and, back when a sidebar could be open, was ~520px at the 760px minimum window
+    width. `@media (max-width: 640px)` cannot see either, which is exactly how `Row`'s stacking
+    breakpoint failed to fire at the size it existed for.
   - An icon leading text that can wrap uses `.u-icon-line` (app.css). Four components had each
     grown an `align-items: center` copy, correct on one line and visibly wrong on two.
+  - **A wrappable flex row's text column needs `flex: 1 1 0`, not `1 1 auto`.** Line breaking uses
+    each item's *hypothetical* main size, and an `auto` basis means max-content — so `Row`'s text
+    column demanded the full label width, wrapped itself onto line two, and stranded the subject
+    glyph alone on line one with the label restarting underneath it. `min-width: 0` does not save
+    you: shrinking happens only after the line has already been broken. This is what "把窗口拉窄，
+    里面的文字排版会完全乱掉" was. Related: `Row`'s wrap rule now puts a `min-width` floor on that
+    column instead of forcing `.right` to `flex-basis: 100%`, so the control drops to a second line
+    only when it genuinely does not fit — 概览's two-up transmitter cards sit permanently under the
+    breakpoint and were spending a whole extra line on a 44px switch.
+
+  Sizes are tokens too, not just colour and space: `--control-h` (32px — Button/Switch/Segmented/
+  swatch rows, anything you *set a value with*) and `--hit` (44px — dock items, probes, picto
+  plates, anything you *aim at*). `--dock-clear` in `App.svelte` is computed from `--hit` rather
+  than hand-summed, because it was a `100px` silently tied to the dock item's size. Both
+  `<dialog>`s take their scrim (`--blur-scrim`, which switches off with the other blurs) and their
+  entrance animation from app.css's bare `dialog` rules — they had each written their own and
+  drifted into arriving differently — and the dismiss X is `ui/CloseButton.svelte` for the same
+  reason. A filled `--danger` surface uses `--danger-on`, not `--surface`: a background token
+  standing in for a foreground worked only because the two invert together between themes, which
+  hid the one pairing that has to be contrast-checked.
 - **`lib/sections/`** — one component per navigation entry, all wrapped in `Section.svelte` (sticky
   translucent header + one measured column). `InputGestures.svelte` is the old 接收器快捷键 tab, renamed
   after what it actually does and now explaining that both gestures feed the pie menu; it hosts the

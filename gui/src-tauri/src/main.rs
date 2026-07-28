@@ -1,6 +1,7 @@
 // Hide the console window on Windows in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod claude_hooks;
 mod claude_status;
 mod commands;
 mod driver;
@@ -93,6 +94,90 @@ fn set_dock_visible(app: &AppHandle, visible: bool) {
     }
 }
 
+/// Re-assert the window's Acrylic backdrop, then force DWM to rebuild the
+/// frame — the two things that have to happen *after* the window becomes
+/// visible for the glass to actually appear.
+///
+/// The symptom this fixes: on every launch the window came up fully opaque, and
+/// the backdrop only showed up once the user minimised it and restored it.
+/// `windowEffects` in tauri.conf.json applies the effect at window *creation*,
+/// but the same file also has `"visible": false` (the window is revealed later,
+/// so autostart can come up straight into the tray) — so the attribute lands on
+/// a window DWM has never composed. DWM does not recomposite an existing frame
+/// just because a backdrop attribute is present, and minimise/restore is simply
+/// the most obvious thing a user can do that forces the recalculation.
+///
+/// `SWP_FRAMECHANGED` asks for that recalculation directly: it sends
+/// `WM_NCCALCSIZE` and makes DWM rebuild the frame, with NOMOVE/NOSIZE/NOZORDER/
+/// NOACTIVATE so nothing else about the window changes. The effect is re-applied
+/// first because the two plausible causes — attribute ignored on a hidden
+/// window, versus attribute stored but never composed — are indistinguishable
+/// from here, and the pair covers both. Cheap, idempotent, and it runs on the
+/// two paths that reveal the window, not on every frame.
+///
+/// Re-applying unconditionally is correct even for someone who turned the glass
+/// *off*: since `gui/src/lib/glass.svelte.js` stopped removing the backdrop
+/// (see its doc comment for why), "off" means the page paints over it, and the
+/// backdrop being present is the state that switch already assumes.
+fn reveal_backdrop(window: &tauri::WebviewWindow) {
+    let _ = window.set_effects(tauri::utils::config::WindowEffectsConfig {
+        effects: vec![tauri::utils::WindowEffect::Acrylic],
+        state: None,
+        radius: None,
+        color: None,
+    });
+
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+            DWM_WINDOW_CORNER_PREFERENCE,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+        };
+        if let Ok(hwnd) = window.hwnd() {
+            unsafe {
+                // Pin the corner radius instead of inheriting it.
+                //
+                // This window is `decorations: false` + `transparent: true`, and
+                // nothing ever told DWM what shape to clip it to — so the radius
+                // was whatever DWM defaults to for such a window, which is not a
+                // documented contract and is not the same thing the *page* draws.
+                // `.app::after` paints the frame hairline in CSS at
+                // `--window-radius`, and when the two disagreed the top-right
+                // corner came apart: the hairline cut across the arc instead of
+                // hugging it, so the close button's red hover fill looked like it
+                // stopped short of the window edge.
+                //
+                // Asking for DWMWCP_ROUND makes the shape a known 8px, which is
+                // what --window-radius is set to. Done before the SetWindowPos
+                // below on purpose: that call forces the frame recalculation, so
+                // the new shape is composed in the same pass rather than waiting
+                // for the next one — the same DWM quirk this whole function
+                // exists for.
+                let pref: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND;
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &pref as *const _ as *const core::ffi::c_void,
+                    std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+                );
+
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    }
+}
+
 /// Reveal and focus the main window (and show the Dock icon).
 fn show_main(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
@@ -100,6 +185,7 @@ fn show_main(app: &AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        reveal_backdrop(&w);
     }
 }
 
@@ -140,7 +226,7 @@ fn menu_state(app: &AppHandle) -> MenuState {
 /// is connected, and their labels show the current mode and what tapping does.
 fn build_menu(app: &AppHandle, state: &MenuState) -> tauri::Result<Menu<Wry>> {
     let (show, nc, nc_power, led, protocol_version, autostart) = state;
-    let open = MenuItem::with_id(app, "open", "打开大疆麦克风控制", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "打开 DJI Mic Control", true, None::<&str>)?;
     let startup = CheckMenuItem::with_id(
         app,
         "toggle-autostart",
@@ -563,6 +649,7 @@ fn main() {
                     set_dock_visible(app.handle(), false);
                 } else {
                     let _ = window.show();
+                    reveal_backdrop(&window);
                 }
             }
 
@@ -738,6 +825,8 @@ fn main() {
             commands::udev_help,
             commands::app_info,
             commands::set_autostart,
+            claude_hooks::claude_hooks_status,
+            claude_hooks::set_claude_hooks,
             driver::install_usb_driver,
             pairing_button::pairing_button_test_active,
             mic_tap::mic_tap_test_status,

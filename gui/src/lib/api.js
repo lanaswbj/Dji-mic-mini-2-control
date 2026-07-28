@@ -44,6 +44,23 @@ export function setAutostart(enabled) {
   return invoke("set_autostart", { enabled });
 }
 
+/**
+ * Whether this app's hook entries are registered in ~/.claude/settings.json.
+ * Never rejects — a missing settings file is an answer, not an error.
+ */
+export function claudeHooksStatus() {
+  return invoke("claude_hooks_status");
+}
+
+/**
+ * Register or unregister them. Resolves with the same shape as
+ * `claudeHooksStatus`, read back from disk *after* the write, so the screen
+ * shows what is actually in the file rather than what it asked for.
+ */
+export function setClaudeHooks(enabled) {
+  return invoke("set_claude_hooks", { enabled });
+}
+
 /** The pie menu's six fixed slots, straight from the code that runs them. */
 export function pieMenuSlots() {
   return invoke("pie_menu_slots");

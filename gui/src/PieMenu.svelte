@@ -11,6 +11,7 @@
     QUESTION_ICON_MAP,
     XMARK_ICON,
   } from "./lib/pieIcons.js";
+  import { pieOrder } from "./lib/pieOrder.svelte.js";
   import { theme } from "./lib/theme.svelte.js";
 
   // This window loads the same bundle as the main one but mounts a different
@@ -26,11 +27,22 @@
   // ITEMS.length (layout, wraparound, close-index) transparently adapts to
   // however many slots the current mode actually has.
   let pendingQuestion = $state(null);
+  // Screen position -> stable slot index (`pie_menu.rs`'s `SLOTS[i].index`,
+  // which is what `pie_menu_select` matches on). The user reorders the fixed
+  // slots from 快捷菜单 in the main window; this is the only place that
+  // knows about it, and `confirmSelection` maps back through it so the backend
+  // still receives the number it always did. A question's slots come from the
+  // backend already in the order it wants them, so they are never reordered.
+  const ORDER = $derived(pendingQuestion ? null : pieOrder.indices);
   const ITEMS = $derived(
-    pendingQuestion ? pendingQuestion.icons.map((_, i) => `q${i}`) : DEFAULT_ITEMS,
+    pendingQuestion
+      ? pendingQuestion.icons.map((_, i) => `q${i}`)
+      : ORDER.map((slot) => DEFAULT_ITEMS[slot]),
   );
   const ICONS = $derived(
-    pendingQuestion ? pendingQuestion.icons.map((key) => QUESTION_ICON_MAP[key] ?? XMARK_ICON) : DEFAULT_ICONS,
+    pendingQuestion
+      ? pendingQuestion.icons.map((key) => QUESTION_ICON_MAP[key] ?? XMARK_ICON)
+      : ORDER.map((slot) => DEFAULT_ICONS[slot]),
   );
 
   // Fallback geometry for the very first frame, before the backend's
@@ -189,7 +201,37 @@
   let closeFired = false;
   let unlistenMove;
 
+  /**
+   * app.css's `prefers-reduced-motion` block cannot reach any of the motion in
+   * this file. It works by overriding `transition-duration` in CSS, and every
+   * moving thing here — the band's left-to-right draw-in, the staggered item
+   * reveal, the sliding highlight, the close slide — is JS writing inline
+   * styles frame by frame. So the one surface that appears unannounced, over
+   * whatever the user was doing, animated at full travel for someone who had
+   * asked for none.
+   *
+   * Read once at module load: a display preference, not something that changes
+   * mid-session.
+   */
+  const REDUCED = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)");
+
   function tick(now) {
+    // Snap, don't ease. Every derived value (fade, groupOpacity, highlightArcD,
+    // itemProgress) stays exactly as correct — it just arrives in one frame,
+    // and the close still completes through the same path below.
+    if (REDUCED?.matches) {
+      openPos = openTarget;
+      highlightAngle = highlightTarget;
+      closeProgress = closeTarget;
+      rafId = null;
+      lastT = 0;
+      if (phase === "closing" && !closeFired) {
+        closeFired = true;
+        finishClose();
+      }
+      return;
+    }
+
     const dt = Math.min((now - lastT) / 1000, 1 / 30);
     lastT = now;
 
@@ -299,10 +341,15 @@
   // closes the overlay, matching the close-slot's own animation/callback
   // shape.
   function confirmSelection() {
-    const index = selected;
+    // `selected` is a screen position. The backend only ever speaks in stable
+    // slot indices, so anything leaving this function goes through ORDER first.
+    // The close branch stays a *positional* test because the close slot is
+    // pinned to the last position (lib/pieOrder.svelte.js) and a question
+    // overlay — which has no ORDER — reuses the same last-slot convention.
+    const index = pendingQuestion ? selected : ORDER[selected];
     if (pendingQuestion) {
       closeWithAnim(() => pieMenuAnswerQuestion(index));
-    } else if (index === ITEMS.length - 1) {
+    } else if (selected === ITEMS.length - 1) {
       closeWithAnim(() => pieMenuSelect(index));
     } else {
       // pie_menu_select (Rust) deliberately hands OS focus back to whatever
@@ -382,6 +429,11 @@
       // this open actually has (6 fixed, or however many icons a pending
       // question sent).
       pendingQuestion = event.payload?.question ?? null;
+      // Re-read the user's slot order. This window has its own JS realm, so it
+      // never sees the main window's in-memory state — only the localStorage
+      // the two share, and only if it asks. Opening is the one moment the
+      // order can matter, so it is the only moment worth asking.
+      pieOrder.refresh();
       selected = 0;
       openedAt = Date.now();
       phase = "open";
@@ -536,6 +588,7 @@
                 type="button"
                 class="qc-row"
                 class:selected={phase === "open" && i === selected}
+                aria-current={phase === "open" && i === selected ? "true" : undefined}
                 onclick={() => {
                   selected = i;
                   highlightTarget = angleFor(selected, ITEMS.length);
@@ -561,17 +614,23 @@
       </div>
     {/if}
 
+    <!-- The arc is icon-only, so `selected` is carried entirely by an accent
+         block sliding behind one glyph. `aria-current` below is what makes that
+         state exist for anything not looking at the pixels. -->
     {#each ITEMS as label, i (label)}
       {@const rad = (angleFor(i, ITEMS.length) * Math.PI) / 180}
       {@const x = PIVOT_X + R_MID * Math.cos(rad) + svgOffsetX}
       {@const y = PIVOT_Y - R_MID * Math.sin(rad)}
       {@const progress = itemProgress(i, ITEMS.length)}
       {@const icon = ICONS[i]}
-      {@const name = pendingQuestion ? (pendingQuestion.labels?.[i] ?? label) : DEFAULT_LABELS[i]}
+      {@const name = pendingQuestion
+        ? (pendingQuestion.labels?.[i] ?? label)
+        : DEFAULT_LABELS[ORDER[i]]}
       <button
         type="button"
         class="item"
         class:selected={phase === "open" && i === selected}
+        aria-current={phase === "open" && i === selected ? "true" : undefined}
         aria-label={name}
         title={name}
         style="left:{x}px; top:{y}px; width:{ITEM_SIZE}px; height:{ITEM_SIZE}px; opacity:{progress}; transform: translate(-50%, -50%) scale({0.55 + 0.45 * progress});"
@@ -674,11 +733,19 @@
 
   /* Quiet brand line — small and low-contrast, with only the star tinted the
      accent color so it reads as a mark, not a heading. */
+  /* The px geometry through this block (gaps, paddings, the card radius) is
+     hand-synced with gui/src-tauri/src/pie_menu.rs's QUESTION_PANEL_* height
+     constants, which is what sizes the overlay *window*. Retokenising those
+     numbers would silently desync the two and leave the card clipped or
+     floating in dead space, so they stay literal. The type sizes below are a
+     different matter: each already equalled a scale step exactly, so they are
+     now named — this was the only place in the app still setting font-size in
+     raw pixels. */
   .qc-header {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--type-label-size);
     font-weight: 600;
     line-height: 1;
     letter-spacing: 0.01em;
@@ -686,7 +753,7 @@
   }
   .qc-star {
     color: var(--accent);
-    font-size: 13px;
+    font-size: var(--type-caption-size);
   }
   .qc-brand {
     color: var(--text-secondary);
@@ -703,7 +770,9 @@
      tracks gui/src-tauri/src/pie_menu.rs's QUESTION_PANEL_TITLE_HEIGHT —
      kept in sync by hand, see that file's matching comment. */
   .qc-title {
-    font-size: 16px;
+    font-size: var(--type-title-sm-size);
+    /* 1.3, not --type-title-sm-line's 1.35: this one *is* load-bearing
+       geometry, see the note above .qc-header. */
     line-height: 1.3;
     font-weight: 700;
     color: var(--text);
@@ -715,19 +784,27 @@
 
   /* Permission mode only: the concrete command/target being requested, shown
      monospaced in a faintly accent-tinted rounded box so it reads as literal
-     text to inspect, not prose. Long commands wrap, then clamp to 3 lines. */
+     text to inspect, not prose.
+
+     It **scrolls** past three lines; it used to `-webkit-line-clamp: 3`. On
+     every other surface in the app truncation costs a detail. Here it costs the
+     end of a command that Enter is about to approve — the ellipsis said "there
+     is more" and offered no way whatsoever to see it, while the button that
+     runs it stayed one keypress away. The three-line budget is kept because the
+     backend sizes the overlay window from it (pie_menu.rs's
+     QUESTION_PANEL_TITLE_HEIGHT), so the box occupies exactly the room it did
+     before — the rest of the text is now reachable instead of gone. */
   .qc-detail {
     font-family: var(--font-mono);
-    font-size: 13px;
-    line-height: 1.4;
+    font-size: var(--type-caption-size);
+    line-height: var(--type-label-line);
     color: var(--text);
     background: color-mix(in srgb, var(--accent) 9%, var(--surface-sunken));
-    border-radius: 10px;
+    border-radius: var(--radius-md);
     padding: 9px 12px;
-    display: -webkit-box;
-    -webkit-line-clamp: 3;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
+    max-height: calc(3em * var(--type-label-line));
+    overflow-y: auto;
+    overscroll-behavior: contain;
     overflow-wrap: anywhere;
   }
 
@@ -740,7 +817,7 @@
   .qc-options {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: var(--space-2);
     width: 86%;
     align-self: center;
   }
@@ -763,7 +840,7 @@
     background: var(--surface-sunken);
     color: var(--text-secondary);
     font: inherit;
-    font-size: 14px;
+    font-size: var(--type-body-size);
     font-weight: 500;
     text-align: left;
     cursor: pointer;
@@ -792,10 +869,15 @@
     flex: 0 0 auto;
   }
 
+  /* Still clamped, unlike .qc-detail above, and the difference is that an
+     option label is bounded by construction — "Allow" / "Deny" / "Allow, don't
+     ask again", or an AskUserQuestion's own choice labels. Two lines is a
+     backstop, not the normal case, and the row height it would have to grow
+     into is one of the numbers pie_menu.rs sizes the window from. */
   .qc-row-label {
     flex: 1 1 auto;
     min-width: 0;
-    line-height: 1.25;
+    line-height: var(--type-title-line);
     display: -webkit-box;
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;

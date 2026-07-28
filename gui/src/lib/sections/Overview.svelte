@@ -101,7 +101,7 @@
     {/if}
 
     {#if quick.length > 0}
-      <Card title="降噪" icon="wave" subtitle="最常用的一项，其余设置在左侧分组中。">
+      <Card title="降噪" icon="wave" subtitle="最常用的一项，其余设置在下方导航栏中。">
         {#snippet actions()}
           <!-- `iconEnd`, not an <Icon> inside the label: a block-level SVG in
                an inline label span forces its own line, which is what put this

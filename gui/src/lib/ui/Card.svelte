@@ -38,18 +38,57 @@
 
 <style>
   .card {
+    /* The responsive container for everything inside a card — `Row` especially.
+       Rows used to size themselves against `@container content`, i.e. the whole
+       content plane, and that measures the wrong box in two ways at once:
+
+       1. It could never fire. The window's minimum width is 760px, which leaves
+          `.content` around 734px, so a `max-width: 560px` query on it needs a
+          ~590px window — narrower than the app can be made. It was dead code.
+          (The rule began as a viewport media query and was moved to a container
+          query to fix exactly this. Deleting the sidebar then made `.content`
+          almost the full window width and reintroduced the same failure one
+          level up.)
+       2. Even at a wide window it is the wrong number. 概览 lays transmitter
+          cards out in a two-column grid, so a card there is ~420px however wide
+          the window is — its rows were cramped at every size.
+
+       A card is the box a row is actually laid out in, so a card is what a row
+       must ask. */
+    container: card / inline-size;
     display: flex;
     flex-direction: column;
     gap: var(--space-4);
     padding: var(--space-5);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    /* Opaque on purpose, even though the window behind it is glass: the
-       content plane under this card is already a translucent material, and
-       stacking a second one on it is the exact combination Apple's material
-       rule forbids. */
-    background: var(--surface);
-    box-shadow: var(--elev-1), var(--edge-highlight);
+    border-radius: var(--radius-xl);
+    /* Opaque — the card is a solid object floating *on* the glass, not a pane
+       of it. The plane below (--glass-content) is the app's only translucent
+       layer.
+
+       Both other arrangements have shipped and both were wrong, in ways worth
+       distinguishing so neither gets "restored":
+
+       - Opaque cards over a *thick* plane (0.48): cards cover nearly the whole
+         content area, so the backdrop only showed in the gaps between them —
+         technically translucent, visually nothing.
+       - Translucent cards (0.62) over that same plane: every line of body text
+         then sat on the sum of two alphas (~0.80 effective), which reads as a
+         washed-out panel rather than a material, and it inverted the platform
+         convention by making the content see-through and the chrome solid.
+
+       What works is opaque cards over a *thin* plane: the plane got much more
+       transparent once nothing had to be legible on it, so the material is
+       continuous across the whole content area instead of surviving only in
+       card gaps, and text contrast here is an exact number again.
+
+       No --glass-gloss: a gloss is what keeps a *translucent* rectangle from
+       reading as a flat panel. On an opaque surface it is just a white streak.
+       --glass-sheen stays — light caught on the top edge is legitimate
+       elevation either way, and it is already flattened to nothing when the
+       glass is off. */
+    background: var(--material-card);
+    box-shadow: var(--glass-sheen), var(--elev-2);
   }
 
   .head {
@@ -59,7 +98,7 @@
   }
 
   .glyph {
-    --glyph: 28px;
+    --glyph: var(--glyph-md);
     display: grid;
     place-items: center;
     width: var(--glyph);
@@ -104,7 +143,7 @@
   [data-tone="warn"] {
     border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
     background: linear-gradient(to right, var(--warn-soft), transparent 320px),
-      var(--surface);
+      var(--material-card);
   }
   [data-tone="warn"] .glyph {
     background: var(--warn-soft);
@@ -113,7 +152,7 @@
   [data-tone="danger"] {
     border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
     background: linear-gradient(to right, var(--danger-soft), transparent 320px),
-      var(--surface);
+      var(--material-card);
   }
   [data-tone="danger"] .glyph {
     background: var(--danger-soft);
@@ -123,7 +162,7 @@
   /* Below the narrow end of the reading column a long title and its action
      button stop fitting side by side; the action wraps under rather than
      crushing the title into a two-word column. */
-  @container content (max-width: 560px) {
+  @container card (max-width: 460px) {
     .head {
       flex-wrap: wrap;
     }

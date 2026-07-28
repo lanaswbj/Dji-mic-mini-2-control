@@ -328,6 +328,19 @@ class DeviceStore {
   /** Write a receiver-level setting. Resolves to an error message, or null. */
   async change(id, value) {
     if (!this.selected) return "尚未选择设备";
+    // A write already in flight for this setting owns it; a second activation is
+    // dropped rather than queued.
+    //
+    // This guard is why the controls no longer disable themselves while writing.
+    // `writes[id]` is set synchronously below, before the await, so
+    // `disabled={state === "writing"}` in SettingRow took effect the instant the
+    // user acted — the control under the keyboard left the tab order,
+    // `document.activeElement` fell back to <body>, and when it re-enabled a
+    // second or three later the focus was gone and the next Tab restarted from
+    // the top of the window. Owning "ignore repeat input" here covers both
+    // control types and every caller from one place, and leaves focus where the
+    // user put it.
+    if (this.writes[id] === "writing") return null;
     // A broadcast write supersedes any per-transmitter override of the same
     // setting; leaving those in place would keep showing the old split.
     if (id === "noise-cancel-power" || id === "noise-cancel") {
@@ -353,6 +366,9 @@ class DeviceStore {
   async changeTx(tx, id, value) {
     if (!this.selected) return "尚未选择设备";
     const key = txKey(tx, id);
+    // Same reasoning as `change` above — the per-transmitter rows use the same
+    // enabled-while-writing controls, keyed per transmitter.
+    if (this.writes[key] === "writing") return null;
     const next = { ...this.optimisticTx };
     if (id === "noise-cancel-power" || id === "noise-cancel") {
       // Snapshot every visible slot before the targeted write: the next status

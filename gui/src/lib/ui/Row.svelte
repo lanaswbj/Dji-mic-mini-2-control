@@ -87,7 +87,7 @@
      flex line's top. Centred is also what the platform's own settings lists
      do. */
   .glyph {
-    --glyph: 28px;
+    --glyph: var(--glyph-md);
     display: grid;
     place-items: center;
     width: var(--glyph);
@@ -113,13 +113,24 @@
   }
 
   /* Grows, so a long description wraps into the space that is actually free
-     rather than only into its own intrinsic width. */
+     rather than only into its own intrinsic width.
+
+     `flex: 1 1 0`, not `1 1 auto`, and that is load-bearing the moment the row
+     is allowed to wrap. An `auto` basis makes this column *demand* its
+     max-content width when the browser decides line breaks — shrinking happens
+     only afterwards — so a long label pushed `.text` itself onto line two and
+     stranded the glyph alone on line one, with the label restarting at the
+     card's left edge underneath it. That is the collapse a narrow window
+     produced, and it is the exact opposite of what the wrap rule at the bottom
+     of this file claims to do. With a zero basis the column never asks for more
+     than it is given, so the glyph keeps the label it names and `.right` is the
+     only thing that can drop. */
   .text {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
     min-width: 0;
-    flex: 1 1 auto;
+    flex: 1 1 0;
   }
 
   .label {
@@ -189,22 +200,47 @@
   /* Below this the control drops under its label rather than squeezing both —
      a squeezed segmented picker is unreadable.
 
-     Measured against the *content column*, not the viewport. As a viewport
-     media query this never fired where it was needed: at the 760px minimum
-     window width with the sidebar open the reading column is only ~520px
-     wide, so every row stayed side-by-side at exactly the size the rule was
-     written to rescue. */
-  @container content (max-width: 560px) {
+     Measured against the **card**, which is the box this row is actually laid
+     out in. This has now been aimed at the wrong container twice, and both
+     misses had the same shape — the rule silently never fired:
+
+     - As a viewport media query: with the old sidebar open, a 760px window left
+       a reading column of only ~520px, so rows stayed side-by-side at exactly
+       the width the rule existed to rescue.
+     - As `@container content`: the sidebar is gone, so `.content` is nearly the
+       whole window. 560px of `.content` needs a ~590px window, below the 760px
+       minimum — unreachable. And it still ignored that 概览's transmitter cards
+       are ~420px wide at *any* window size.
+
+     See Card.svelte, which declares the container. */
+  @container card (max-width: 560px) {
     .row {
       flex-wrap: wrap;
       row-gap: var(--space-2);
     }
-    /* Only the control drops to a second line — the glyph stays with the
-       label it names, which is the whole reason it is there. */
+    /* The control drops *only when it doesn't fit*, rather than unconditionally.
+       `flex: 1 1 100%` forced every row in a narrow card onto two lines, which
+       is why 概览's transmitter cards — always under this breakpoint, since they
+       sit two-up — spent a whole extra line on a 44px switch with a two-
+       character label beside it. A floor on the text column is what makes the
+       decision content-aware instead: while the label can still hold 11rem the
+       control stays beside it, and a wide one (a three-option Segmented is the
+       case this rule was written for) can no longer fit, so it wraps. */
+    .text {
+      min-width: 11rem;
+    }
+    /* `auto`, so the control is flush right on either line: on line one .text's
+       growth already puts it there, on line two this is what puts it there. */
     .right {
-      flex: 1 1 100%;
-      justify-content: space-between;
-      margin-left: 0;
+      margin-left: auto;
+    }
+    /* The 68px reservation exists so a write state appearing cannot nudge the
+       control sideways. In a card this narrow it costs more than it saves: it
+       is empty in every idle row, and 68px of nothing is exactly what tips a
+       row over into wrapping. The shift it prevents is a few px on a surface
+       that is already reflowing. */
+    .write-state {
+      min-width: 0;
     }
   }
 </style>

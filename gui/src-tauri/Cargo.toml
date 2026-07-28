@@ -29,6 +29,11 @@ cpal = "0.15"
 # on `earshot`/`microdsp` here.
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    # DwmSetWindowAttribute, for pinning the main window's corner radius
+    # explicitly rather than inheriting whatever DWM picks for a borderless
+    # transparent window — main.rs::reveal_backdrop and --window-radius in
+    # gui/src/app.css have to describe the same shape.
+    "Win32_Graphics_Dwm",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input",

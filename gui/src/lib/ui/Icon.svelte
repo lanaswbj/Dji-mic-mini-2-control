@@ -41,7 +41,6 @@
     "corner-down-left": "M19 5v7.5a2 2 0 0 1-2 2H6M9.5 11L6 14.5 9.5 18",
     refresh: "M20 12a8 8 0 1 1-2.5-5.8M20 4v4.5h-4.5",
     rollback: "M4 12a8 8 0 1 0 2.5-5.8M4 4v4.5h4.5",
-    sidebar: "M4 5h16v14H4zM10 5v14",
     minimize: "M5 12h14",
     maximize: "M5.5 5.5h13v13h-13z",
     restore: "M8.5 8.5h10v10h-10zM5.5 15.5v-10h10",
@@ -78,8 +77,13 @@
     hash: "M9.8 4.4L8.2 19.6M15.8 4.4l-1.6 15.2M4.4 9.4h15.2M3.9 14.6h15.2",
     link: "M10.4 13.6a4.1 4.1 0 0 0 5.8 0l2.3-2.3a4.1 4.1 0 1 0-5.8-5.8l-1.3 1.3M13.6 10.4a4.1 4.1 0 0 0-5.8 0l-2.3 2.3a4.1 4.1 0 1 0 5.8 5.8l1.3-1.3",
 
-    // --- Theme ---------------------------------------------------------
-    sun: "M12 15.8a3.8 3.8 0 1 0 0-7.6 3.8 3.8 0 0 0 0 7.6M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M18.4 5.6l-1.6 1.6M7.2 16.8l-1.6 1.6",
+    /* --- Theme -----------------------------------------------------------
+       No `sun`. This table is the app's icon *inventory*, not a library: an
+       entry nothing renders is indistinguishable from one whose usage was
+       deleted by accident, and both cost the next reader the same grep. The
+       appearance control is a single 深色 switch (Preferences.svelte), so there
+       has never been a light-theme glyph to draw — the same reason `sidebar`
+       left with the sidebar. */
     moon: "M20 14.3A8.6 8.6 0 0 1 9.7 4 8.5 8.5 0 1 0 20 14.3",
     monitor: "M3.5 5h17v11h-17zM9 20h6M12 16v4",
   };
