@@ -75,9 +75,25 @@ Write-Host '    + DJI Mic Control.exe (portable)'
 
 # NSIS installer: registers the app in Add/Remove Programs and the Start menu,
 # and auto-provisions the WebView2 runtime on install.
-$Setup = Get-ChildItem (Join-Path $ScriptDir 'target\release\bundle\nsis') `
-             -Filter '*-setup.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $Setup) { throw 'NSIS installer not found in target\release\bundle\nsis' }
+#
+# Matched by the version in tauri.conf.json, not by `-First 1`. Cargo never
+# cleans this directory, so every installer this machine has ever produced is
+# still in it — including ones from another version under another product name.
+# `Select-Object -First 1` picked whichever came back first, and it put a
+# nine-month-old 1.1.0 installer inside a 2.0.0 release, with the leak scan
+# below dutifully verifying the wrong file. Anything other than exactly one
+# match is now a build failure: guessing is what caused that.
+$Version = (Get-Content (Join-Path $ScriptDir 'gui\src-tauri\tauri.conf.json') -Raw |
+            ConvertFrom-Json).version
+if (-not $Version) { throw 'Could not read version from gui\src-tauri\tauri.conf.json' }
+$Setups = @(Get-ChildItem (Join-Path $ScriptDir 'target\release\bundle\nsis') `
+                -Filter "*_${Version}_x64-setup.exe" -ErrorAction SilentlyContinue)
+if ($Setups.Count -ne 1) {
+    throw ("Expected exactly one NSIS installer for version $Version in " +
+           "target\release\bundle\nsis, found $($Setups.Count): " +
+           (($Setups | Select-Object -ExpandProperty Name) -join ', '))
+}
+$Setup = $Setups[0]
 Copy-Item $Setup.FullName (Join-Path $Out $Setup.Name)
 Write-Host "    + $($Setup.Name) (installer)"
 
